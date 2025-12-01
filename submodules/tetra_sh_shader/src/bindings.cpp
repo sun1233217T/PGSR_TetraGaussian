@@ -6,6 +6,7 @@
 #include "voxel_initialize.h"
 #include "voxel_grid.h"
 #include "voxel_node.h"
+#include "rasterizer_torch.h"
 
 namespace py = pybind11;
 
@@ -120,4 +121,25 @@ PYBIND11_MODULE(tetra_sh_shader_cpp, m) {
     m.def("build_coarse_index", &build_coarse_index,
           py::arg("grid"), py::arg("res") = 8, py::arg("on_cuda") = false,
           "构建 coarse 索引，返回 (occ uint8[res,res,res], offsets int64[B+1], keys int64[N,3], bitmask uint64[B])");
+    m.def("rasterize_image", &rasterize_image,
+          py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
+          py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
+          py::arg("vertex_features") = torch::Tensor(),
+          "占位体素渲染：内部生成射线并调用 CUDA kernel，输出 HxWx3 颜色");
+    m.def("rasterize_image_with_index", &rasterize_image_with_index,
+          py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
+          py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
+          py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
+          py::arg("vertex_features") = torch::Tensor(),
+          "使用预计算 coarse 索引的占位渲染（避免每帧重建 coarse 索引），输出 HxWx3 颜色");
+    m.def("rasterize_image_with_index_dense", &rasterize_image_with_index_dense,
+          py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
+          py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
+          py::arg("vertex_sigma"), py::arg("vertex_color"), py::arg("vertex_mask"),
+          py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
+          "使用预计算 coarse 索引和稠密顶点网格的渲染（避免重复构建稠密网格），输出 HxWx3 颜色");
+
+    m.def("build_dense_vertex_grids_from_features", &build_dense_vertex_grids_from_features,
+          py::arg("grid"), py::arg("vertex_features"),
+          "将顶点特征映射到稠密网格 (sigma, color, valid, xyz)");
 }

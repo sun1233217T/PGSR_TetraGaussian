@@ -7,8 +7,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 from tetra_sh_shader import pre_resterization
+from tetra_sh_shader import rasterize, rasterize_with_coarse, build_coarse_index
 from utils.graphics_utils import getWorld2View2
+import cv2
+import time
+
+from mtools import debug
 
 
 def load_tetra():
@@ -44,7 +50,7 @@ def generate_camera_rays(W, H, fov_deg=60.0, cam_z=-2.0, d=1.0):
     b = 2 * np.sum(oc * dirs, axis=1)
     c = np.sum(oc * oc, axis=1) - d
     disc = b * b - 4 * c
-    mask = disc >= 0
+    mask = disc <= 0
     return origins[mask], dirs[mask]
 
 
@@ -168,18 +174,37 @@ def main() -> int:
                         help="相机列表文件（image [mask] intrinsic extrinsic）或 Colmap 数据集路径（自动用 alpha 掩码）")
     parser.add_argument("--resize", type=int, default=50, help="rays_from_image_mask 的下采样倍数")
     parser.add_argument("--feature-dim", type=int, default=0, help=">0 时，对稀疏网格运行 vertex feature 初始化测试 (C 维)")
-    parser.add_argument("--feature-device", type=str, default="cpu", help="feature 初始化的目标设备")
+    parser.add_argument("--feature-device", type=str, default="cuda", help="feature 初始化的目标设备")
     parser.add_argument("--feature-fill", type=float, default=0.0, help="feature 初始化填充值（float 模式）")
     parser.add_argument("--feature-as-int", action="store_true", help="以 int64 而非 float 初始化 feature 张量")
+    parser.add_argument("--dump-coarse", action="store_true", help="构建 coarse 占据网格并打印统计")
+    parser.add_argument("--coarse-res", type=int, default=8, help="coarse 网格边长")
+    parser.add_argument("--coarse-device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="coarse 网格输出设备")
+    parser.add_argument("--dump-coarse-index", action="store_true", help="构建 coarse 索引并打印统计")
+    parser.add_argument("--render", action="store_true", help="调用占位渲染并写出 test_output/render.png")
+    parser.add_argument("--render-output", type=str, default="test_output/render.png", help="渲染输出路径")
+    parser.add_argument("--render-coarse-res", type=int, default=8, help="渲染使用的 coarse 网格分辨率")
     args = parser.parse_args()
 
     tsh = load_tetra()
-
+    render_intrinsic = None
+    render_extrinsic = None
+    render_W = None
+    render_H = None
+    cams = []
+    coarse_tuple = None
     if args.cam_list:
         from scene.dataset_readers import sceneLoadTypeCallbacks
         scene = sceneLoadTypeCallbacks["Colmap"](Path(args.cam_list), "images", False)
         print(f"[test.py] loaded scene from {args.cam_list}")
+        # debug()
         sparse = pre_resterization.pre_rasterize_scene(scene, voxel_size=args.voxel_size, resize=args.resize)
+        cams, _, _ = load_cameras_from_file(Path(args.cam_list))
+        # if cams:
+        #     render_intrinsic = cams[0]["intrinsic"]
+        #     render_extrinsic = cams[0]["extrinsic"]
+        #     render_W = int(cams[0]["intrinsic"][0, 2] * 2)
+        #     render_H = int(cams[0]["intrinsic"][1, 2] * 2)
     elif args.image and args.intrinsic and args.extrinsic:
         o, d, o_neg, d_neg = rays_from_image_mask(args.image, args.mask, args.intrinsic, args.extrinsic, resize=args.resize)
         grid = tsh.VoxelGrid()
@@ -194,6 +219,11 @@ def main() -> int:
         tsh.grid_init(grid)
         tsh.image_pre_resterization(grid, o, d)
         sparse = tsh.grad_sparsilization(grid, tolerant=2, invert=False)
+        # 记录单张相机参数用于渲染
+        render_intrinsic = np.load(args.intrinsic) if args.intrinsic.endswith(".npy") else np.loadtxt(args.intrinsic)
+        render_extrinsic = np.load(args.extrinsic) if args.extrinsic.endswith(".npy") else np.loadtxt(args.extrinsic)
+        render_W = int(round(render_intrinsic[0, 2] * 2))
+        render_H = int(round(render_intrinsic[1, 2] * 2))
     else:
         o, d = generate_camera_rays(args.res[0], args.res[1], fov_deg=args.fov, cam_z=args.cam_z, d=args.ball_r)
         print(f"[test.py] generated {o.shape[0]} rays hitting the unit sphere")
@@ -206,9 +236,37 @@ def main() -> int:
         tsh.grid_init(grid)
         tsh.image_pre_resterization(grid, o, d)
         sparse = tsh.grad_sparsilization(grid, tolerant=2, invert=False)
+        # 构造合成相机参数
+        fx = args.res[0] / (2 * np.tan(np.deg2rad(args.fov) / 2))
+        fy = args.res[1] / (2 * np.tan(np.deg2rad(args.fov) / 2))
+        cx = args.res[0] * 0.5
+        cy = args.res[1] * 0.5
+        render_intrinsic = np.array([[fx, 0, cx],
+                                     [0, fy, cy],
+                                     [0,  0,  1]], dtype=np.float32)
+        cam_pos = np.array([0.0, 0.0, args.cam_z], dtype=np.float32)
+        cam_rot = np.eye(3, dtype=np.float32)
+        render_extrinsic = np.eye(4, dtype=np.float32)
+        render_extrinsic[:3, :3] = cam_rot.T
+        render_extrinsic[:3, 3] = -cam_rot.T @ cam_pos
+        render_W = args.res[0]
+        render_H = args.res[1]
+
+    # 初始化顶点特征 [N,4]：sigma/opacity=1，RGB=1.0
+    vertex_features = tsh.initialize_vertex_features(
+        sparse,
+        4,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        fill_value=0.1,
+        as_int=False,
+    )
+    if vertex_features.numel() > 0:
+        vertex_features[:, 0] = 1.0
+        vertex_features[:, 1:] = 1.0
 
     out_path = Path(args.output)
     sparse.write_tetra_ply(str(out_path))
+    print(f"[test.py] sparse grid built: num_voxels={sparse.cell_count()}, num_vertices={sparse.vertex_count()}")
     print(f"[test.py] wrote {out_path}")
 
     if args.feature_dim > 0:
@@ -220,10 +278,105 @@ def main() -> int:
             as_int=args.feature_as_int,
         )
         print(f"[test.py] initialized vertex features: shape={tuple(feats.shape)}, device={feats.device}, dtype={feats.dtype}")
+        print(f"[test.py] sparse grid update: num_voxels={sparse.cell_count()}, num_vertices={sparse.vertex_count()}")
         if feats.numel() > 0:
             sample = feats[0].detach().cpu().numpy()
             print(f"[test.py] sample[0]: {sample}")
-    return 0
+
+    if args.dump_coarse:
+        want_cuda = False
+        if args.coarse_device == "cuda":
+            want_cuda = torch.cuda.is_available()
+            if not want_cuda:
+                print("[test.py] requested cuda coarse grid but CUDA not available, falling back to CPU")
+        elif args.coarse_device == "auto":
+            want_cuda = torch.cuda.is_available()
+
+        coarse = tsh.build_coarse_occupancy(sparse, res=args.coarse_res, on_cuda=want_cuda)
+        nonzero = int(coarse.sum().item())
+        print(f"[test.py] coarse occupancy built: shape={tuple(coarse.shape)}, device={coarse.device}, nonzero={nonzero}")
+
+    if args.dump_coarse_index:
+        want_cuda = False
+        if args.coarse_device == "cuda":
+            want_cuda = torch.cuda.is_available()
+            if not want_cuda:
+                print("[test.py] requested cuda coarse grid but CUDA not available, falling back to CPU")
+        elif args.coarse_device == "auto":
+            want_cuda = torch.cuda.is_available()
+
+        occ, offsets, keys, mask = tsh.build_coarse_index(sparse, res=args.coarse_res, on_cuda=want_cuda)
+        total = int(offsets[-1].item()) if offsets.numel() > 0 else 0
+        nz_bricks = int(occ.sum().item())
+        print(f"[test.py] coarse index built: occ_shape={tuple(occ.shape)}, offsets_shape={tuple(offsets.shape)}, keys_shape={tuple(keys.shape)}, mask_shape={tuple(mask.shape)}, device={occ.device}")
+        print(f"[test.py]   bricks with voxels={nz_bricks}, total voxels listed={total}")
+
+    if args.render:
+        if not torch.cuda.is_available():
+            print("[test.py] CUDA not available, skip rendering")
+            return 0
+        out_dir = Path(args.render_output).parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if (render_intrinsic is None or render_extrinsic is None or render_W is None or render_H is None) and not cams:
+            print("[test.py] render_intrinsic/extrinsic not available, skip rendering")
+            return 0
+
+        if coarse_tuple is None:
+            coarse_tuple = tsh.build_coarse_index(sparse, res=args.render_coarse_res, on_cuda=False)
+        vertex_dense = tsh.build_dense_vertex_grids_from_features(sparse, vertex_features)
+        
+        if cams:
+            for cam in cams:
+                render_intrinsic = cam["intrinsic"]
+                render_extrinsic = cam["extrinsic"]
+                render_W = int(render_intrinsic[0, 2] * 2)
+                render_H = int(render_intrinsic[1, 2] * 2)
+                intr_t = torch.tensor(render_intrinsic, device="cuda", dtype=torch.float32)
+                extr_t = torch.tensor(render_extrinsic, device="cuda", dtype=torch.float32)
+                # while (1):
+                time0 = time.time()
+                # debug()
+                colors = tsh.rasterize_with_coarse(
+                    sparse,
+                    intr_t,
+                    extr_t,
+                    coarse_tuple,
+                    int(render_H),
+                    int(render_W),
+                    coarse_res=args.render_coarse_res,
+                    vertex_features=None,
+                    vertex_dense=vertex_dense,
+                )
+                time1 = time.time()
+                print("[test.py] rasterization timing test: {:.2f} ms".format((time1 - time0) * 1000))
+                out_path = out_dir / (Path(cam["image"]).stem + "_render.png")
+                img = colors.detach().cpu().clamp(0, 1).numpy()
+                img = (img * 255).astype(np.uint8).reshape(render_H, render_W, 3)
+                cv2.imwrite(str(out_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                print(f"[test.py] rendered image saved to {out_path}")
+            return 0
+        else:
+            H = render_H
+            W = render_W
+            intr_t = torch.tensor(render_intrinsic, device="cuda", dtype=torch.float32)
+            extr_t = torch.tensor(render_extrinsic, device="cuda", dtype=torch.float32)
+            colors = tsh.rasterize_with_coarse(
+                sparse,
+                intr_t,
+                extr_t,
+                coarse_tuple,
+                int(H),
+                int(W),
+                coarse_res=args.render_coarse_res,
+                vertex_features=None,
+                vertex_dense=vertex_dense,
+            )
+            sparse.write_tetra_ply(str(out_path))
+            img = colors.detach().cpu().clamp(0, 1).numpy()
+            img = (img * 255).astype(np.uint8).reshape(H, W, 3)
+            cv2.imwrite(str(args.render_output), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            print(f"[test.py] rendered image saved to {args.render_output}")
+        return 0
 
 
 if __name__ == "__main__":

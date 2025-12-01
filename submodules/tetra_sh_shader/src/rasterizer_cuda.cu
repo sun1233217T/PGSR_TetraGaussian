@@ -46,12 +46,104 @@ __device__ inline bool intersect_aabb(
     return true;
 }
 
+// 体积近似着色：对段端点做一次三线性插值并用梯形近似密度/颜色。
+__device__ inline void shade_voxel_segment(
+    const float3& p0,
+    const float3& p1,
+    const float3& vmin,
+    const float3& vmax,
+    int vx,
+    int vy,
+    int vz,
+    const float* __restrict__ vertex_sigma,
+    const float* __restrict__ vertex_color,
+    const uint8_t* __restrict__ vertex_valid,
+    int3 v_dims,
+    float& transmittance,
+    float* __restrict__ out_rgb) {
+    auto clamp01 = [](float v) { return fminf(fmaxf(v, 0.f), 1.f); };
+    auto idx = [&](int x, int y, int z) {
+        return (x * v_dims.y + y) * v_dims.z + z;
+    };
+    auto sample = [&](const float3& p, float& sigma_out, float3& color_out) {
+        float ux = clamp01((p.x - vmin.x) / (vmax.x - vmin.x));
+        float uy = clamp01((p.y - vmin.y) / (vmax.y - vmin.y));
+        float uz = clamp01((p.z - vmin.z) / (vmax.z - vmin.z));
+        float w[2] = {1.f - ux, ux};
+        float v[2] = {1.f - uy, uy};
+        float t[2] = {1.f - uz, uz};
+        int ix0 = vx;
+        int ix1 = min(vx + 1, v_dims.x - 1);
+        int iy0 = vy;
+        int iy1 = min(vy + 1, v_dims.y - 1);
+        int iz0 = vz;
+        int iz1 = min(vz + 1, v_dims.z - 1);
+        const int xs[2] = {ix0, ix1};
+        const int ys[2] = {iy0, iy1};
+        const int zs[2] = {iz0, iz1};
+
+        float sigma_acc = 0.f;
+        float3 c_acc = make_float3(0.f, 0.f, 0.f);
+        float weight_sum = 0.f;
+        for (int a = 0; a < 2; ++a) {
+            for (int b = 0; b < 2; ++b) {
+                for (int c = 0; c < 2; ++c) {
+                    float wgt = w[a] * v[b] * t[c];
+                    int id = idx(xs[a], ys[b], zs[c]);
+                    if (vertex_valid && vertex_valid[id] == 0) continue;
+                    float sig = vertex_sigma ? vertex_sigma[id] : 0.0f;
+                    int base = id * 3;
+                    float cx = vertex_color ? vertex_color[base + 0] : 0.0f;
+                    float cy = vertex_color ? vertex_color[base + 1] : 0.0f;
+                    float cz = vertex_color ? vertex_color[base + 2] : 0.0f;
+                    sigma_acc += wgt * sig;
+                    c_acc.x += wgt * cx;
+                    c_acc.y += wgt * cy;
+                    c_acc.z += wgt * cz;
+                    weight_sum += wgt;
+                }
+            }
+        }
+        if (weight_sum > 0.f) {
+            float inv = 1.f / weight_sum;
+            sigma_out = sigma_acc * inv;
+            color_out = make_float3(c_acc.x * inv, c_acc.y * inv, c_acc.z * inv);
+        } else {
+            sigma_out = 0.f;
+            color_out = make_float3(0.f, 0.f, 0.f);
+        }
+    };
+
+    float sigma0, sigma1;
+    float3 col0, col1;
+    sample(p0, sigma0, col0);
+    sample(p1, sigma1, col1);
+    float sigma_m = 0.5f * (sigma0 + sigma1);
+    float3 col_m = make_float3(0.5f * (col0.x + col1.x),
+                               0.5f * (col0.y + col1.y),
+                               0.5f * (col0.z + col1.z));
+
+    float dt = sqrtf((p1.x - p0.x) * (p1.x - p0.x) +
+                     (p1.y - p0.y) * (p1.y - p0.y) +
+                     (p1.z - p0.z) * (p1.z - p0.z));
+    if (dt <= 0.f) return;
+    float alpha = 1.f - __expf(-sigma_m * dt);
+    float weight = transmittance * alpha;
+    out_rgb[0] += weight * col_m.x;
+    out_rgb[1] += weight * col_m.y;
+    out_rgb[2] += weight * col_m.z;
+    transmittance *= __expf(-sigma_m * dt);
+}
+
 __global__ void rasterize_kernel(
     const float* __restrict__ rays_o,
     const float* __restrict__ rays_d,
     const int64_t* __restrict__ offsets,
     const int64_t* __restrict__ keys,
     const uint64_t* __restrict__ mask,
+    const float* __restrict__ vertex_sigma,  // dense grid [Dx+1,Dy+1,Dz+1]
+    const float* __restrict__ vertex_color,  // dense grid [Dx+1,Dy+1,Dz+1,3] packed
+    const uint8_t* __restrict__ vertex_valid,// dense grid mask same shape
     float* __restrict__ out,
     int64_t num_rays,
     int64_t width,
@@ -132,6 +224,7 @@ __global__ void rasterize_kernel(
 
     // 细体素级占位渲染：在当前 coarse brick 内逐个细体素做 AABB 相交并累加颜色
     const float eps = 1e-4f; // 边界容差，避免因浮点截断漏掉靠近砖界的体素
+    float transmittance = 1.f;
     while (in_bounds(cx, cy, cz) && t0 <= t1) {
         int64_t b = (static_cast<int64_t>(cx) * coarse_res + cy) * coarse_res + cz;
         int64_t off0 = offsets[b];
@@ -209,6 +302,7 @@ __global__ void rasterize_kernel(
             }
 
             int out_idx = idx * 3;
+            float* out_ptr = out + out_idx;
             for (int64_t i = off0; i < off1; ++i) {
                 int64_t vx = keys[i * 3 + 0];
                 int64_t vy = keys[i * 3 + 1];
@@ -225,14 +319,21 @@ __global__ void rasterize_kernel(
                 }
                 if (vt0 < 0.f) vt0 = 0.f;
                 // 只渲染当前 coarse brick 内且进入首个含占据子块之后的命中段
-                if (vt0 + eps < search_start_t || vt0 - eps > brick_exit_t) continue;
-                if (out[out_idx + 0] < 0.95f) {
-                    out[out_idx + 0] += 0.1f * (1.f - out[out_idx + 0]);
-                    out[out_idx + 1] += 0.1f * (1.f - out[out_idx + 1]);
-                    out[out_idx + 2] += 0.1f * (1.f - out[out_idx + 2]);
-                } else {
-                    return;
-                }
+                float t_start = fmaxf(vt0, search_start_t);
+                float t_end = fminf(vt1, brick_exit_t);
+                if (t_end <= t_start) continue;
+                float3 p0_seg = make_float3(o.x + d.x * t_start,
+                                            o.y + d.y * t_start,
+                                            o.z + d.z * t_start);
+                float3 p1_seg = make_float3(o.x + d.x * t_end,
+                                            o.y + d.y * t_end,
+                                            o.z + d.z * t_end);
+                shade_voxel_segment(
+                    p0_seg, p1_seg, vmin, vmax, static_cast<int>(vx), static_cast<int>(vy), static_cast<int>(vz),
+                    vertex_sigma, vertex_color, vertex_valid,
+                    make_int3(dims.x + 1, dims.y + 1, dims.z + 1),
+                    transmittance, out_ptr);
+                if (transmittance < 1e-4f) return; // 透射率很低时提前退出
             }
         }
 
@@ -277,6 +378,9 @@ torch::Tensor rasterize_forward_cuda(
     const torch::Tensor& coarse_offsets,
     const torch::Tensor& voxel_keys,
     const torch::Tensor& coarse_mask,
+    const torch::Tensor& vertex_sigma,
+    const torch::Tensor& vertex_color,
+    const torch::Tensor& vertex_mask,
     int64_t height,
     int64_t width,
     float origin_x,
@@ -298,6 +402,13 @@ torch::Tensor rasterize_forward_cuda(
     auto offsets = coarse_offsets.contiguous();
     auto keys = voxel_keys.contiguous();
     auto mask = coarse_mask.contiguous();
+    const bool has_vertex = vertex_sigma.defined() && vertex_color.defined() &&
+                            vertex_sigma.numel() > 0 && vertex_color.numel() > 0;
+    auto v_sigma = has_vertex ? vertex_sigma.to(ro.device()).contiguous().to(torch::kFloat32) : torch::Tensor();
+    auto v_color = has_vertex ? vertex_color.to(ro.device()).contiguous().to(torch::kFloat32) : torch::Tensor();
+    auto v_mask  = (vertex_mask.defined() && vertex_mask.numel() > 0)
+        ? vertex_mask.to(ro.device()).contiguous()
+        : torch::Tensor();
 
     const int64_t num_rays = ro.size(0);
     auto out = torch::zeros({height, width, 3}, torch::TensorOptions().device(ro.device()).dtype(torch::kFloat32));
@@ -324,6 +435,9 @@ torch::Tensor rasterize_forward_cuda(
         offsets.data_ptr<int64_t>(),
         keys.data_ptr<int64_t>(),
         mask.data_ptr<uint64_t>(),
+        has_vertex ? v_sigma.data_ptr<float>() : nullptr,
+        has_vertex ? v_color.data_ptr<float>() : nullptr,
+        v_mask.defined() ? v_mask.data_ptr<uint8_t>() : nullptr,
         out.data_ptr<float>(),
         num_rays,
         width,

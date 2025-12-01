@@ -29,11 +29,21 @@ from tetra_sh_shader_cpp import (
     ensure_active_cells_from_vertex_attr,
     build_coarse_occupancy,
     build_coarse_index,
+    rasterize_image,
+    rasterize_image_with_index,
+    rasterize_image_with_index_dense,
+    build_dense_vertex_grids_from_features,
 )
 from .pre_resterization import (
     rays_from_image_mask,
     cameras_from_scene,
     pre_rasterize_scene,
+)
+from .rasterizer import (
+    rasterize,
+    rasterize_with_coarse,
+    VoxelRasterizeFunction,
+    VoxelRasterizeWithCoarseFunction,
 )
 from .voxel_init import initialize_vertex_features
 
@@ -75,6 +85,14 @@ __all__ = [
     "ensure_active_cells_from_vertex_attr",
     "build_coarse_occupancy",
     "build_coarse_index",
+    "rasterize_image",
+    "rasterize_image_with_index",
+    "rasterize_image_with_index_dense",
+    "build_dense_vertex_grids_from_features",
+    "rasterize",
+    "rasterize_with_coarse",
+    "VoxelRasterizeFunction",
+    "VoxelRasterizeWithCoarseFunction",
     "initialize_vertex_features",
     "rays_from_image_mask",
     "cameras_from_scene",
