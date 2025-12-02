@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=65", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tetra-sh-shader"
+version = "0.1.0"
+description = "Test harness and CMake project for tetrahedral SH-style shading experiments."
+readme = "README.md"
+authors = [{ name = "PGSR", email = "dev@pgsr.invalid" }]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+homepage = "https://example.com"
+repository = "https://example.com/repo"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]

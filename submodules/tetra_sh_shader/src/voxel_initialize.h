@@ -20,3 +20,12 @@ torch::Tensor attach_vertex_tensor(VoxelGrid& grid, const torch::Tensor& tensor)
 // 依据顶点是否有 attr，补齐所有“活跃”体素单元（八个角有任意一个带 attr 即视为活跃）。
 // 返回新增的体素数量。
 size_t ensure_active_cells_from_vertex_attr(VoxelGrid& grid);
+
+// 构建粗粒度占据网格（默认 8x8x8）。返回 torch::Tensor (uint8)。
+torch::Tensor build_coarse_occupancy(const VoxelGrid& grid, int64_t res = 8, bool on_cuda = false);
+
+// 构建 coarse 索引：占据网格 + 砖偏移 + 体素列表 + 砖内粗 bitmask。
+// 返回 (occupancy uint8[res,res,res], offsets int64[B+1], keys int64[N,3], bitmask uint64[B])
+// 其中 B=res^3，offsets 给出每个砖的体素列表范围，keys 为按砖分桶压紧的 VoxelKey。
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+build_coarse_index(const VoxelGrid& grid, int64_t res = 8, bool on_cuda = false);

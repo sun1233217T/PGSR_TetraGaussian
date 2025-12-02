@@ -81,9 +81,9 @@ class OptimizationParams(ParamGroup):
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0025
-        self.opacity_lr = 0.05
-        self.scaling_lr = 0.005
+        self.feature_lr = 0.006
+        self.opacity_lr = 0.01
+        self.scaling_lr = 0.0
         self.rotation_lr = 0.001
         self.percent_dense = 0.001
         self.lambda_dssim = 0.2
@@ -101,21 +101,27 @@ class OptimizationParams(ParamGroup):
         self.use_virtul_cam = False
         self.virtul_cam_prob = 0.5
         self.use_multi_view_trim = True
-        self.multi_view_ncc_weight = 0.15
-        self.multi_view_geo_weight = 0.03
-        self.multi_view_weight_from_iter = 7000
+        self.multi_view_ncc_weight = 0.0015
+        self.multi_view_geo_weight = 0.0003
+        self.multi_view_weight_from_iter = 70000000
         self.multi_view_patch_size = 3
         self.multi_view_sample_num = 102400
         self.multi_view_pixel_noise_th = 1.0
         self.wo_use_geo_occ_aware = False
 
         self.opacity_cull_threshold = 0.005
-        self.densify_abs_grad_threshold = 0.0008
+        self.densify_abs_grad_threshold = -0.005
         self.abs_split_radii2D_threshold = 20
         self.max_abs_split_points = 50_000
-        self.max_all_points = 6000_000
+        self.max_all_points = 3000_000
         self.exposure_compensation = False
         self.random_background = False
+
+        self.cat_low_app_opc = 0.00 # 0.005
+        self.cat_low_app_opc_until_iter = 30_00000
+        self.app_decaly_confidance = 0.995
+        self.app_opc_opc_loss = 0.00001 #0.00005
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

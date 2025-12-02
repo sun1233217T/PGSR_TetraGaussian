@@ -37,6 +37,9 @@ except ImportError:
 import time
 import torch.nn.functional as F
 
+from mtools import debug, logger, Recorder
+logger.setLevel("INFO")
+
 def setup_seed(seed):
      torch.manual_seed(seed)
      torch.cuda.manual_seed_all(seed)
@@ -93,7 +96,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cmd = f'cp -rf ./utils {dataset.model_path}/'
     os.system(cmd)
 
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(dataset.sh_degree, opt.cat_low_app_opc)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
@@ -111,6 +114,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    viewpoint_stack = scene.getTrainCameras().copy()
+    all_viewpoint_len = len(viewpoint_stack)
+    gaussians.set_decaly_ratio(all_viewpoint_len,confidance = opt.app_decaly_confidance)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -148,7 +155,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            viewpoint_indices = list(range(len(viewpoint_stack)))
+        randint_val = randint(0, len(viewpoint_stack)-1)
+        viewpoint_cam = viewpoint_stack.pop(randint_val)
+        vind = viewpoint_indices.pop(randint_val)
 
         gt_image, gt_image_gray = viewpoint_cam.get_image()
         if iteration > 1000 and opt.exposure_compensation:
@@ -160,7 +170,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, app_model=app_model,
-                            return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter)
+                            return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter, return_app_opacity=True)
         image, viewspace_point_tensor, visibility_filter, radii = \
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
@@ -329,8 +339,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ncc_loss = ncc_weight * ncc.mean()
                             loss += ncc_loss
 
+        if opt.app_opc_opc_loss and iteration > 500 and gaussians.app_opacity_mask.sum() > 0:
+            app_opacities = render_pkg["app_opacity"]
+            # app_opc_loss = (gaussians.get_opacity - gaussians.app_opacity).pow(3).mean() # new_app_opc_opc_loss_1
+            # app_opc_loss = (gaussians.get_opacity / (gaussians.app_opacity + 1e-3)).mean() # new_app_opc_opc_loss_2
+            app_opc_loss =  ((gaussians.get_opacity / (app_opacities + 1e-4)) * gaussians.app_opacity_mask).mean() # new_app_opc_opc_loss_4
+            # app_opc_loss = - torch.log(gaussians.app_opacity / (gaussians.get_opacity + 1e-4) + 1e-4).mean() # new_app_opc_opc_loss_3
+            loss += app_opc_loss * opt.app_opc_opc_loss
+        else:
+            app_opc_loss = 0
+
         loss.backward()
         iter_end.record()
+
+        if iteration % 1000 == 0:
+            import matplotlib.pyplot as plt
+            t_gaussians = gaussians.oct_gs_cells
+            t_level = [t_gaussian.level for t_gaussian in t_gaussians]
+            t_grad = gaussians.xyz_gradient_accum.cpu()
+            t_grad2 = gaussians.xyz_gradient_accum_abs.cpu()
+            # t_grad_sc = gaussians._scaling.grad.detach().cpu().numpy().sum(-1)
+            t_grad_sc = gaussians.get_scaling.grad.detach().cpu().numpy().sum(-1)
+            t_grad_sc = t_grad_sc.clip(-3*t_grad_sc.std(), 3*t_grad_sc.std())
+            fig = plt.figure(figsize=(12,8))
+            # level as x and grad1, grad2 as y
+            plt.subplot(2,2,1)
+            plt.scatter(t_level, t_grad, s=1, c='r', label='grad',alpha=0.1)
+            plt.xlabel('level')
+            plt.ylabel('grad')
+            plt.subplot(2,2,2)
+            plt.scatter(t_level, t_grad2, s=1, c='b', label='grad_abs',alpha=0.1)
+            plt.xlabel('level')
+            plt.ylabel('grad_abs')
+            plt.subplot(2,2,3)
+            plt.scatter(t_level, t_grad_sc, s=1, c='g', label='sc_grad',alpha=0.1)
+            plt.xlabel('level')
+            plt.ylabel('sc_grad')
+            plt.subplot(2,2,4)
+            plt.scatter(t_grad2, t_grad_sc, s=1, c='k', label='sc_grad - grad_abs',alpha=0.1)
+            plt.xlabel('grad_abs')
+            plt.ylabel('sc_grad')
+            plt.savefig("%05d"%iteration + "_grad_level.png")
+            
 
         with torch.no_grad():
             # Progress bar
@@ -362,8 +412,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Keep track of max radii in image-space for pruning
                 mask = (render_pkg["out_observe"] > 0) & visibility_filter
                 gaussians.max_radii2D[mask] = torch.max(gaussians.max_radii2D[mask], radii[mask])
-                viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
-                gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
+                # viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
+                # viewspace_point_tensor_scale = gaussians._scaling.grad.detach()
+                # debug()
+                viewspace_point_tensor_scale = gaussians.get_scaling.grad.detach()
+                # debug()
+                gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_scale, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -381,6 +435,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 prune_mask = (observe_cnt < observe_the).squeeze()
                 if prune_mask.sum() > 0:
                     gaussians.prune_points(prune_mask)
+            elif iteration % opt.densification_interval == 0 and gaussians.app_opacity is not None and opt.cat_low_app_opc and iteration < opt.cat_low_app_opc_until_iter and iteration > opt.densify_from_iter:
+                gaussians.cat_low_app_opacity(radii)
 
             # reset_opacity
             if iteration < opt.densify_until_iter:
@@ -398,6 +454,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
                 app_model.save_weights(scene.model_path, iteration)
+
+            if TENSORBOARD_FOUND and vind == 10:
+                gt_image = torch.clamp(gt_image, 0.0, 1.0)
+                output_img = torch.clamp(image, 0.0, 1.0)
+                tb_writer.add_images('train_view_{}/render'.format(vind), output_img[None], global_step=iteration)
+                tb_writer.add_images('train_view_{}/ground_truth'.format(vind), gt_image[None], global_step=iteration)
     
     app_model.save_weights(scene.model_path, opt.iterations)
     torch.cuda.empty_cache()
@@ -483,8 +545,35 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument('--tensorboard', action='store_true', default=False, help="Use tensorboard to log the training process")
+    parser.add_argument('--replace_params_name', type=str, default=None, help="Replace the parameters of the model with the given name")
+    parser.add_argument('--replace_params_value', type=float, default=None, help="Replace the parameters of the model with the given value")
+    parser.add_argument('--ddebug', action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+
+    if not args.tensorboard:
+        TENSORBOARD_FOUND = False
+
+    if args.ddebug:
+        logger.setLevel("DEBUG")
+
+    if TENSORBOARD_FOUND:
+        for files in os.listdir(args.model_path):
+            if files.startswith("events.out.tfevents"):
+                os.remove(os.path.join(args.model_path, files))
+        writer = SummaryWriter(args.model_path)
+
+    if args.replace_params_name != None:
+        if args.replace_params_value == None:
+            logger.error("Parameter --replace_params_value is required if --replace_params_name is used")
+            sys.exit(1)
+        else:
+            if args.replace_params_name in vars(args):
+                logger.info(f"Parameter {args.replace_params_name} found in the arguments, original value: {vars(args)[args.replace_params_name]}")
+            setattr(args, args.replace_params_name, args.replace_params_value)
+            logger.info(f"Parameter {args.replace_params_name} replaced with {args.replace_params_value}")
+
     
     print("Optimizing " + args.model_path)
 

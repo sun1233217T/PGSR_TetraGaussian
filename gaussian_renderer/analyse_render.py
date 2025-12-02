@@ -11,13 +11,12 @@
 
 import torch
 import math
-from diff_plane_rasterization import GaussianRasterizationSettings as PlaneGaussianRasterizationSettings
-from diff_plane_rasterization import GaussianRasterizer as PlaneGaussianRasterizer
+from diff_plane_rasterization_analyse import GaussianRasterizationSettings as PlaneGaussianRasterizationSettings
+from diff_plane_rasterization_analyse import GaussianRasterizer as PlaneGaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from scene.app_model import AppModel
 from utils.sh_utils import eval_sh
 from utils.graphics_utils import normal_from_depth_image
-from .analyse_render import render_analyse
 
 def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     # depth: (H, W), bg_color: (3), alpha: (H, W)
@@ -33,10 +32,8 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     normal_ref = normal_ref.permute(2,0,1)
     return normal_ref
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
-           app_model: AppModel=None, return_plane = True, return_depth_normal = True, return_app_opacity=False):
-    if return_app_opacity:
-        return render_analyse(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color, app_model=app_model, return_plane=return_plane, return_depth_normal=return_depth_normal)
+def render_analyse(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
+           app_model: AppModel=None, return_plane = True, return_depth_normal = True):
     """
     Render the scene. 
     
@@ -108,7 +105,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rasterizer = PlaneGaussianRasterizer(raster_settings=raster_settings)
 
     if not return_plane:
-        rendered_image, radii, out_observe, _, _ = rasterizer(
+        rendered_image, radii, out_observe, _, _, app_opacity, rendered_opacity = rasterizer(
             means3D = means3D,
             means2D = means2D,
             means2D_abs = means2D_abs,
@@ -119,12 +116,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
         
+        pc.store_app_opacity(app_opacity)
+        rendered_opacity = rendered_opacity.clamp(1e-6, 1 - 1e-6)
+        
         return_dict =  {"render": rendered_image,
                         "viewspace_points": screenspace_points,
                         "viewspace_points_abs": screenspace_points_abs,
                         "visibility_filter" : radii > 0,
                         "radii": radii,
-                        "out_observe": out_observe}
+                        "out_observe": out_observe,
+                        "app_opacity" : app_opacity,
+                        "render_opacity": rendered_opacity}
         if app_model is not None and pc.use_app:
             appear_ab = app_model.appear_ab[torch.tensor(viewpoint_camera.uid).cuda()]
             app_image = torch.exp(appear_ab[0]) * rendered_image + appear_ab[1]
@@ -141,7 +143,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     input_all_map[:, 3] = 1.0
     input_all_map[:, 4] = local_distance
 
-    rendered_image, radii, out_observe, out_all_map, plane_depth = rasterizer(
+    rendered_image, radii, out_observe, out_all_map, plane_depth, app_opacity, rendered_opacity = rasterizer(
         means3D = means3D,
         means2D = means2D,
         means2D_abs = means2D_abs,
@@ -152,6 +154,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = rotations,
         all_map = input_all_map,
         cov3D_precomp = cov3D_precomp)
+    
+    pc.store_app_opacity(app_opacity)
+    rendered_opacity = rendered_opacity.clamp(1e-6, 1 - 1e-6)
 
     rendered_normal = out_all_map[0:3]
     rendered_alpha = out_all_map[3:4, ]
@@ -165,7 +170,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "out_observe": out_observe,
                     "rendered_normal": rendered_normal,
                     "plane_depth": plane_depth,
-                    "rendered_distance": rendered_distance
+                    "rendered_distance": rendered_distance,
+                    "app_opacity" : app_opacity,
+                    "render_opacity": rendered_opacity
                     }
     
     if app_model is not None and pc.use_app:

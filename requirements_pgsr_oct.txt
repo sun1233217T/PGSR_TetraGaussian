@@ -1,0 +1,27 @@
+# Base scientific stack
+numpy>=1.24
+scipy>=1.11
+
+# Core project deps
+open3d
+pytorch3d
+plyfile
+opencv-python
+lpips
+trimesh
+
+# GPU / PyTorch (install torch with the wheel matching your CUDA version)
+# torch
+# torchvision
+# torchaudio
+
+# Geometry / OpenGL helpers
+PyOpenGL
+PyOpenGL_accelerate
+glfw
+PyGLM
+pybind11
+
+# Optional build tooling
+setuptools>=65
+wheel

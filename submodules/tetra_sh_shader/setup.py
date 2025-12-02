@@ -3,7 +3,7 @@ from pathlib import Path
 from setuptools import find_packages, setup
 
 try:
-    from torch.utils.cpp_extension import BuildExtension, CppExtension
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 except ImportError as exc:
     raise RuntimeError("Building tetra_sh_shader_cpp now requires PyTorch to be installed.") from exc
 
@@ -12,20 +12,25 @@ readme = (root / "README.md").read_text(encoding="utf-8") if (root / "README.md"
 
 sources = [
     "src/bindings.cpp",
-    "src/rasterization_forward.cpp",
-    "src/rasterization_backward.cpp",
     "src/voxel_node.cpp",
     "src/voxel_grid.cpp",
     "src/pre_resterization.cpp",
     "src/voxel_utility.cpp",
     "src/voxel_initialize.cpp",
+    "src/rasterizer_torch.cpp",
+]
+cuda_sources = [
+    "src/rasterizer_cuda.cu",
 ]
 
 ext_modules = [
-    CppExtension(
+    CUDAExtension(
         "tetra_sh_shader_cpp",
-        sources=sources,
-        extra_compile_args={"cxx": ["-fopenmp"]},
+        sources=sources + cuda_sources,
+        extra_compile_args={
+            "cxx": ["-fopenmp"],
+            "nvcc": ["-lineinfo"],
+        },
         extra_link_args=["-fopenmp"],
     )
 ]

@@ -137,8 +137,7 @@ PYBIND11_MODULE(tetra_sh_shader_cpp, m) {
           py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
           py::arg("vertex_sigma"), py::arg("vertex_color"), py::arg("vertex_mask"),
           py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
-          "使用预计算 coarse 索引和稠密顶点网格的渲染（避免重复构建稠密网格），输出 HxWx3 颜色");
-
+          "使用预计算 coarse 索引和稠密顶点网格的渲染（vertex_sigma/color/mask 已在外部构建），输出 HxWx3 颜色");
     m.def("build_dense_vertex_grids_from_features", &build_dense_vertex_grids_from_features,
           py::arg("grid"), py::arg("vertex_features"),
           "将顶点特征映射到稠密网格 (sigma, color, valid, xyz)");

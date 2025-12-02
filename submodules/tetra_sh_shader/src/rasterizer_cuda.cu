@@ -105,9 +105,9 @@ __device__ inline void shade_voxel_segment(
             }
         }
         if (weight_sum > 0.f) {
-            float inv = 1.f / weight_sum;
-            sigma_out = sigma_acc * inv;
-            color_out = make_float3(c_acc.x * inv, c_acc.y * inv, c_acc.z * inv);
+            // 不再对有效角权重做归一化：invalid 视作 0 贡献，直接保留累加结果
+            sigma_out = sigma_acc;
+            color_out = c_acc;
         } else {
             sigma_out = 0.f;
             color_out = make_float3(0.f, 0.f, 0.f);
@@ -223,7 +223,7 @@ __global__ void rasterize_kernel(
     float tDeltaZ = delta_t(d.z, sz0, sz1);
 
     // 细体素级占位渲染：在当前 coarse brick 内逐个细体素做 AABB 相交并累加颜色
-    const float eps = 1e-4f; // 边界容差，避免因浮点截断漏掉靠近砖界的体素
+    const float eps = voxel_size * 1e-4f; // 边界容差与体素尺度相关，避免漏掉靠近砖界的体素
     float transmittance = 1.f;
     while (in_bounds(cx, cy, cz) && t0 <= t1) {
         int64_t b = (static_cast<int64_t>(cx) * coarse_res + cy) * coarse_res + cz;
@@ -236,9 +236,9 @@ __global__ void rasterize_kernel(
             float search_start_t = t0;
             uint64_t brick_mask = mask[b];
             if (brick_mask != 0ULL) {
-                float sub_size_x = voxel_size * (static_cast<float>(brick_size.x) / 4.f);
-                float sub_size_y = voxel_size * (static_cast<float>(brick_size.y) / 4.f);
-                float sub_size_z = voxel_size * (static_cast<float>(brick_size.z) / 4.f);
+                float sub_size_x = (sx1 - sx0) * 0.25f;
+                float sub_size_y = (sy1 - sy0) * 0.25f;
+                float sub_size_z = (sz1 - sz0) * 0.25f;
 
                 // 当前点所在子块索引（0..3）
                 float3 p_cur = make_float3(o.x + d.x * t0, o.y + d.y * t0, o.z + d.z * t0);
@@ -301,8 +301,12 @@ __global__ void rasterize_kernel(
                 }
             }
 
-            int out_idx = idx * 3;
-            float* out_ptr = out + out_idx;
+            // 收集当前砖内射线命中并按进入 t 升序排序
+            constexpr int kMaxHits = 256;
+            float t_enter_buf[kMaxHits];
+            float t_exit_buf[kMaxHits];
+            int hit_idx_buf[kMaxHits];
+            int hit_count = 0;
             for (int64_t i = off0; i < off1; ++i) {
                 int64_t vx = keys[i * 3 + 0];
                 int64_t vy = keys[i * 3 + 1];
@@ -318,10 +322,49 @@ __global__ void rasterize_kernel(
                     continue;
                 }
                 if (vt0 < 0.f) vt0 = 0.f;
-                // 只渲染当前 coarse brick 内且进入首个含占据子块之后的命中段
                 float t_start = fmaxf(vt0, search_start_t);
                 float t_end = fminf(vt1, brick_exit_t);
                 if (t_end <= t_start) continue;
+                if (hit_count < kMaxHits) {
+                    t_enter_buf[hit_count] = t_start;
+                    t_exit_buf[hit_count] = t_end;
+                    hit_idx_buf[hit_count] = static_cast<int>(i);
+                    ++hit_count;
+                }
+            }
+
+            // 插入排序（命中数量受限于砖尺寸，总体较小）
+            for (int a = 1; a < hit_count; ++a) {
+                float t_in = t_enter_buf[a];
+                float t_out = t_exit_buf[a];
+                int k_idx = hit_idx_buf[a];
+                int b = a - 1;
+                while (b >= 0 && t_enter_buf[b] > t_in) {
+                    t_enter_buf[b + 1] = t_enter_buf[b];
+                    t_exit_buf[b + 1] = t_exit_buf[b];
+                    hit_idx_buf[b + 1] = hit_idx_buf[b];
+                    --b;
+                }
+                t_enter_buf[b + 1] = t_in;
+                t_exit_buf[b + 1] = t_out;
+                hit_idx_buf[b + 1] = k_idx;
+            }
+
+            int out_idx = idx * 3;
+            float* out_ptr = out + out_idx;
+            for (int h = 0; h < hit_count; ++h) {
+                int64_t key_idx = hit_idx_buf[h];
+                int64_t vx = keys[key_idx * 3 + 0];
+                int64_t vy = keys[key_idx * 3 + 1];
+                int64_t vz = keys[key_idx * 3 + 2];
+                float3 vmin = make_float3(origin.x + voxel_size * vx,
+                                          origin.y + voxel_size * vy,
+                                          origin.z + voxel_size * vz);
+                float3 vmax = make_float3(vmin.x + voxel_size,
+                                          vmin.y + voxel_size,
+                                          vmin.z + voxel_size);
+                float t_start = t_enter_buf[h];
+                float t_end = t_exit_buf[h];
                 float3 p0_seg = make_float3(o.x + d.x * t_start,
                                             o.y + d.y * t_start,
                                             o.z + d.z * t_start);

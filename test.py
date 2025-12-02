@@ -262,7 +262,7 @@ def main() -> int:
     )
     if vertex_features.numel() > 0:
         vertex_features[:, 0] = 1.0
-        vertex_features[:, 1:] = 1.0
+        vertex_features[:, 1:] = torch.randn_like(vertex_features[:, 1:]) * 0.5 + 0.5
 
     out_path = Path(args.output)
     sparse.write_tetra_ply(str(out_path))

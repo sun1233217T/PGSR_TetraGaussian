@@ -1,0 +1,52 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Build outputs
+build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+Makefile
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.ply
+*.zip
+p2p_test
+
+# Python packaging artifacts
+*.egg-info/
+*.egg
+*.whl
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Generated assets
+debug_*.png
+debug_*.ply
+test_output/
+output/
+tmp.ply
+test_output_1/
+glm/
+third_party/
+diff-plane-rasterization_analyse/
+diff-plane-rasterization/
+data
