@@ -4,14 +4,17 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cmath>
 
 #include "rasterizer_torch.h"
 
 namespace {
 
-// 简单占位 kernel：为每条射线写常量颜色。
+struct VertexWeight {
+    int idx;
+    float w;
+};
+
 __device__ inline bool intersect_aabb(
     const float3& o,
     const float3& d,
@@ -34,9 +37,7 @@ __device__ inline bool intersect_aabb(
         float tnear = (min_c - o_c) * inv;
         float tfar  = (max_c - o_c) * inv;
         if (tnear > tfar) {
-            float tmp = tnear;
-            tnear = tfar;
-            tfar = tmp;
+            float tmp = tnear; tnear = tfar; tfar = tmp;
         }
         tmin = tnear > tmin ? tnear : tmin;
         tmax = tfar  < tmax ? tfar  : tmax;
@@ -47,105 +48,209 @@ __device__ inline bool intersect_aabb(
     return true;
 }
 
-// 体积近似着色：对段端点做一次三线性插值并用梯形近似密度/颜色。
-__device__ inline void shade_voxel_segment(
-    const float3& p0,
-    const float3& p1,
+// 采样体素角点，返回 sigma/颜色，并记录权重用于反向。
+__device__ inline void sample_point(
+    const float3& p,
     const float3& vmin,
     const float3& vmax,
-    int vx,
-    int vy,
-    int vz,
+    int vx, int vy, int vz,
     const float* __restrict__ vertex_sigma,
     const float* __restrict__ vertex_color,
     const uint8_t* __restrict__ vertex_valid,
     int3 v_dims,
-    float& transmittance,
-    float* __restrict__ out_rgb) {
+    float& sigma_out,
+    float3& color_out,
+    VertexWeight (&weights)[8],
+    int& wcount) {
     auto clamp01 = [](float v) { return fminf(fmaxf(v, 0.f), 1.f); };
     auto idx = [&](int x, int y, int z) {
         return (x * v_dims.y + y) * v_dims.z + z;
     };
-    auto sample = [&](const float3& p, float& sigma_out, float3& color_out) {
-        float ux = clamp01((p.x - vmin.x) / (vmax.x - vmin.x));
-        float uy = clamp01((p.y - vmin.y) / (vmax.y - vmin.y));
-        float uz = clamp01((p.z - vmin.z) / (vmax.z - vmin.z));
-        float w[2] = {1.f - ux, ux};
-        float v[2] = {1.f - uy, uy};
-        float t[2] = {1.f - uz, uz};
-        int ix0 = vx;
-        int ix1 = min(vx + 1, v_dims.x - 1);
-        int iy0 = vy;
-        int iy1 = min(vy + 1, v_dims.y - 1);
-        int iz0 = vz;
-        int iz1 = min(vz + 1, v_dims.z - 1);
-        const int xs[2] = {ix0, ix1};
-        const int ys[2] = {iy0, iy1};
-        const int zs[2] = {iz0, iz1};
+    float ux = clamp01((p.x - vmin.x) / (vmax.x - vmin.x));
+    float uy = clamp01((p.y - vmin.y) / (vmax.y - vmin.y));
+    float uz = clamp01((p.z - vmin.z) / (vmax.z - vmin.z));
+    float w[2] = {1.f - ux, ux};
+    float v[2] = {1.f - uy, uy};
+    float t[2] = {1.f - uz, uz};
+    int ix0 = vx;
+    int ix1 = min(vx + 1, v_dims.x - 1);
+    int iy0 = vy;
+    int iy1 = min(vy + 1, v_dims.y - 1);
+    int iz0 = vz;
+    int iz1 = min(vz + 1, v_dims.z - 1);
+    const int xs[2] = {ix0, ix1};
+    const int ys[2] = {iy0, iy1};
+    const int zs[2] = {iz0, iz1};
 
-        float sigma_acc = 0.f;
-        float3 c_acc = make_float3(0.f, 0.f, 0.f);
-        float weight_sum = 0.f;
-        for (int a = 0; a < 2; ++a) {
-            for (int b = 0; b < 2; ++b) {
-                for (int c = 0; c < 2; ++c) {
-                    float wgt = w[a] * v[b] * t[c];
-                    int id = idx(xs[a], ys[b], zs[c]);
-                    if (vertex_valid && vertex_valid[id] == 0) continue;
-                    float sig = vertex_sigma ? vertex_sigma[id] : 0.0f;
-                    int base = id * 3;
-                    float cx = vertex_color ? vertex_color[base + 0] : 0.0f;
-                    float cy = vertex_color ? vertex_color[base + 1] : 0.0f;
-                    float cz = vertex_color ? vertex_color[base + 2] : 0.0f;
-                    sigma_acc += wgt * sig;
-                    c_acc.x += wgt * cx;
-                    c_acc.y += wgt * cy;
-                    c_acc.z += wgt * cz;
-                    weight_sum += wgt;
+    sigma_out = 0.f;
+    color_out = make_float3(0.f, 0.f, 0.f);
+    wcount = 0;
+    for (int a = 0; a < 2; ++a) {
+        for (int b = 0; b < 2; ++b) {
+            for (int c = 0; c < 2; ++c) {
+                float wgt = w[a] * v[b] * t[c];
+                int id = idx(xs[a], ys[b], zs[c]);
+                if (vertex_valid && vertex_valid[id] == 0) continue;
+                float sig = vertex_sigma ? vertex_sigma[id] : 0.0f;
+                int base = id * 3;
+                float cx = vertex_color ? vertex_color[base + 0] : 0.0f;
+                float cy = vertex_color ? vertex_color[base + 1] : 0.0f;
+                float cz = vertex_color ? vertex_color[base + 2] : 0.0f;
+                sigma_out += wgt * sig;
+                color_out.x += wgt * cx;
+                color_out.y += wgt * cy;
+                color_out.z += wgt * cz;
+                if (wgt > 0.f && wcount < 8) {
+                    weights[wcount].idx = id;
+                    weights[wcount].w = wgt;
+                    ++wcount;
                 }
             }
         }
-        if (weight_sum > 0.f) {
-            // 不再对有效角权重做归一化：invalid 视作 0 贡献，直接保留累加结果
-            sigma_out = sigma_acc;
-            color_out = c_acc;
-        } else {
-            sigma_out = 0.f;
-            color_out = make_float3(0.f, 0.f, 0.f);
-        }
-    };
+    }
+}
 
+__device__ inline void compute_segment_values(
+    const float3& p0,
+    const float3& p1,
+    const float3& vmin,
+    const float3& vmax,
+    int vx, int vy, int vz,
+    const float* __restrict__ vertex_sigma,
+    const float* __restrict__ vertex_color,
+    const uint8_t* __restrict__ vertex_valid,
+    int3 v_dims,
+    float& sigma_m,
+    float3& col_m,
+    float& dt_out,
+    float& exp_term_out) {
+    VertexWeight w0[8], w1[8];
+    int c0 = 0, c1 = 0;
     float sigma0, sigma1;
     float3 col0, col1;
-    sample(p0, sigma0, col0);
-    sample(p1, sigma1, col1);
-    float sigma_m = 0.5f * (sigma0 + sigma1);
-    float3 col_m = make_float3(0.5f * (col0.x + col1.x),
-                               0.5f * (col0.y + col1.y),
-                               0.5f * (col0.z + col1.z));
+    sample_point(p0, vmin, vmax, vx, vy, vz,
+                 vertex_sigma, vertex_color, vertex_valid, v_dims,
+                 sigma0, col0, w0, c0);
+    sample_point(p1, vmin, vmax, vx, vy, vz,
+                 vertex_sigma, vertex_color, vertex_valid, v_dims,
+                 sigma1, col1, w1, c1);
 
+    sigma_m = 0.5f * (sigma0 + sigma1);
+    col_m = make_float3(0.5f * (col0.x + col1.x),
+                        0.5f * (col0.y + col1.y),
+                        0.5f * (col0.z + col1.z));
     float dt = sqrtf((p1.x - p0.x) * (p1.x - p0.x) +
                      (p1.y - p0.y) * (p1.y - p0.y) +
                      (p1.z - p0.z) * (p1.z - p0.z));
-    if (dt <= 0.f) return;
-    float alpha = 1.f - __expf(-sigma_m * dt);
-    float weight = transmittance * alpha;
-    out_rgb[0] += weight * col_m.x;
-    out_rgb[1] += weight * col_m.y;
-    out_rgb[2] += weight * col_m.z;
-    transmittance *= __expf(-sigma_m * dt);
+    dt_out = dt;
+    exp_term_out = (dt > 0.f) ? __expf(-sigma_m * dt) : 1.f;
 }
 
-__global__ void rasterize_kernel(
+// 对单段做正向累积和反向散射到顶点。
+__device__ inline void shade_segment_backward(
+    const float3& p0,
+    const float3& p1,
+    const float3& vmin,
+    const float3& vmax,
+    int vx, int vy, int vz,
+    const float* __restrict__ vertex_sigma,
+    const float* __restrict__ vertex_color,
+    const uint8_t* __restrict__ vertex_valid,
+    int3 v_dims,
+    const float* __restrict__ grad_out_ptr,
+    float T_in,
+    float grad_T_next,
+    float& grad_T_out,
+    float& sigma_m,
+    float& dt_out,
+    float& exp_term_out,
+    float* __restrict__ grad_sigma,
+    float* __restrict__ grad_color) {
+    VertexWeight w0[8], w1[8];
+    int c0 = 0, c1 = 0;
+    float sigma0, sigma1;
+    float3 col0, col1;
+    sample_point(p0, vmin, vmax, vx, vy, vz,
+                 vertex_sigma, vertex_color, vertex_valid, v_dims,
+                 sigma0, col0, w0, c0);
+    sample_point(p1, vmin, vmax, vx, vy, vz,
+                 vertex_sigma, vertex_color, vertex_valid, v_dims,
+                 sigma1, col1, w1, c1);
+
+    sigma_m = 0.5f * (sigma0 + sigma1);
+    float3 col_m = make_float3(0.5f * (col0.x + col1.x),
+                               0.5f * (col0.y + col1.y),
+                               0.5f * (col0.z + col1.z));
+    float dt = sqrtf((p1.x - p0.x) * (p1.x - p0.x) +
+                     (p1.y - p0.y) * (p1.y - p0.y) +
+                     (p1.z - p0.z) * (p1.z - p0.z));
+    dt_out = dt;
+    if (dt <= 0.f) {
+        grad_T_out = grad_T_next;
+        exp_term_out = 1.f;
+        return;
+    }
+
+    float alpha = 1.f - __expf(-sigma_m * dt);
+    float exp_term = 1.f - alpha;
+    exp_term_out = exp_term;
+    float weight = T_in * alpha;
+
+    float dL_dweight = grad_out_ptr[0] * col_m.x +
+                       grad_out_ptr[1] * col_m.y +
+                       grad_out_ptr[2] * col_m.z;
+
+    // 更新 grad_T：来自当前段 + 未来段
+    grad_T_out = grad_T_next * exp_term + dL_dweight * alpha;
+
+    // sigma_m 梯度
+    float g_sigma_m = T_in * dt * exp_term * (dL_dweight - grad_T_next);
+
+    // col_m 梯度
+    float g_col_m_x = grad_out_ptr[0] * weight;
+    float g_col_m_y = grad_out_ptr[1] * weight;
+    float g_col_m_z = grad_out_ptr[2] * weight;
+
+    // 反向散射到顶点（端点各 0.5 系数）
+    auto scatter = [&](const VertexWeight* ws, int cnt, float factor_sigma,
+                       float fx, float fy, float fz) {
+        for (int i = 0; i < cnt; ++i) {
+            int id = ws[i].idx;
+            float w = ws[i].w * factor_sigma;
+            atomicAdd(grad_sigma + id, g_sigma_m * w);
+            int base = id * 3;
+            atomicAdd(grad_color + base + 0, fx * ws[i].w * 0.5f);
+            atomicAdd(grad_color + base + 1, fy * ws[i].w * 0.5f);
+            atomicAdd(grad_color + base + 2, fz * ws[i].w * 0.5f);
+        }
+    };
+
+    scatter(w0, c0, 0.5f, g_col_m_x, g_col_m_y, g_col_m_z);
+    scatter(w1, c1, 0.5f, g_col_m_x, g_col_m_y, g_col_m_z);
+}
+
+struct Hit {
+    float t_enter;
+    float t_exit;
+    int key_idx;
+    float sigma_m;
+    float dt;
+    float exp_term;
+    float T_in;
+};
+
+__global__ void rasterize_backward_kernel(
     const float* __restrict__ rays_o,
     const float* __restrict__ rays_d,
     const int64_t* __restrict__ offsets,
     const int64_t* __restrict__ keys,
     const uint64_t* __restrict__ mask,
-    const float* __restrict__ vertex_sigma,  // dense grid [Dx+1,Dy+1,Dz+1]
-    const float* __restrict__ vertex_color,  // dense grid [Dx+1,Dy+1,Dz+1,3] packed
-    const uint8_t* __restrict__ vertex_valid,// dense grid mask same shape
-    float* __restrict__ out,
+    const float* __restrict__ vertex_sigma,
+    const float* __restrict__ vertex_color,
+    const uint8_t* __restrict__ vertex_valid,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_sigma,
+    float* __restrict__ grad_color,
     int64_t num_rays,
     int64_t width,
     float3 origin,
@@ -159,18 +264,14 @@ __global__ void rasterize_kernel(
     float3 o = make_float3(rays_o[idx * 3 + 0], rays_o[idx * 3 + 1], rays_o[idx * 3 + 2]);
     float3 d = make_float3(rays_d[idx * 3 + 0], rays_d[idx * 3 + 1], rays_d[idx * 3 + 2]);
 
-    // AABB of full grid
     float3 bmin = origin;
     float3 bmax = make_float3(origin.x + voxel_size * dims.x,
                               origin.y + voxel_size * dims.y,
                               origin.z + voxel_size * dims.z);
     float t0, t1;
-    if (!intersect_aabb(o, d, bmin, bmax, t0, t1) || t1 < 0.f) {
-        return;
-    }
+    if (!intersect_aabb(o, d, bmin, bmax, t0, t1) || t1 < 0.f) return;
     if (t0 < 0.f) t0 = 0.f;
 
-    // brick bounds helpers (per-axis, handle last brick width)
     auto brick_bounds = [&](int b, int brick, int dim, float org, float& start, float& end) {
         int v_start = b * brick;
         int v_end = v_start + brick;
@@ -188,7 +289,6 @@ __global__ void rasterize_kernel(
         return (end - start) / fabsf(d_c);
     };
 
-    // starting coarse idx: 先转体素索引再按整数砖划分，和 host 端一致
     auto voxel_idx = [&](float p_c, float org_c, int dim_c) {
         int v = static_cast<int>(floorf((p_c - org_c) / voxel_size));
         if (v < 0) v = 0;
@@ -223,25 +323,28 @@ __global__ void rasterize_kernel(
     float tDeltaY = delta_t(d.y, sy0, sy1);
     float tDeltaZ = delta_t(d.z, sz0, sz1);
 
-    // 细体素级占位渲染：在当前 coarse brick 内逐个细体素做 AABB 相交并累加颜色
-    const float eps = voxel_size * 1e-4f; // 边界容差与体素尺度相关，避免漏掉靠近砖界的体素
-    float transmittance = 1.f;
+    const float eps = voxel_size * 1e-4f;
+    const int out_idx = idx * 3;
+    const float* grad_out_ptr = grad_out + out_idx;
+
+    // 反向路径目前仅处理命中数不超过 256 的情况；更大的砖会退化到反复扫描。
+    constexpr int kMaxHits = 256;
+    Hit hit_buf[kMaxHits];
+    int hit_count = 0;
+
     while (in_bounds(cx, cy, cz) && t0 <= t1) {
         int64_t b = (static_cast<int64_t>(cx) * coarse_res + cy) * coarse_res + cz;
         int64_t off0 = offsets[b];
         int64_t off1 = offsets[b + 1];
         if (off1 > off0) {
-            float brick_exit_t = fminf(tMaxX, fminf(tMaxY, tMaxZ)) + eps; // 当前 coarse brick 的射线退出时间
+            float brick_exit_t = fminf(tMaxX, fminf(tMaxY, tMaxZ)) + eps;
 
-            // 先在 4x4x4 细分格上做一次 DDA，利用 mask 快速跳过无占据子块
             float search_start_t = t0;
             uint64_t brick_mask = mask[b];
             if (brick_mask != 0ULL) {
                 float sub_size_x = (sx1 - sx0) * 0.25f;
                 float sub_size_y = (sy1 - sy0) * 0.25f;
                 float sub_size_z = (sz1 - sz0) * 0.25f;
-
-                // 当前点所在子块索引（0..3）
                 float3 p_cur = make_float3(o.x + d.x * t0, o.y + d.y * t0, o.z + d.z * t0);
                 int sub_x = static_cast<int>(floorf((p_cur.x - sx0) / sub_size_x));
                 int sub_y = static_cast<int>(floorf((p_cur.y - sy0) / sub_size_y));
@@ -249,7 +352,6 @@ __global__ void rasterize_kernel(
                 sub_x = max(0, min(3, sub_x));
                 sub_y = max(0, min(3, sub_y));
                 sub_z = max(0, min(3, sub_z));
-
                 auto sub_bounds = [&](int s, float sub_size, float start_axis, float& a0, float& a1) {
                     a0 = start_axis + sub_size * static_cast<float>(s);
                     a1 = (s == 3) ? start_axis + sub_size * 4.f : a0 + sub_size;
@@ -258,7 +360,6 @@ __global__ void rasterize_kernel(
                 sub_bounds(sub_x, sub_size_x, sx0, sx_sub0, sx_sub1);
                 sub_bounds(sub_y, sub_size_y, sy0, sy_sub0, sy_sub1);
                 sub_bounds(sub_z, sub_size_z, sz0, sz_sub0, sz_sub1);
-
                 float subMaxX = t_to_exit(o.x, d.x, sx_sub0, sx_sub1, step_x);
                 float subMaxY = t_to_exit(o.y, d.y, sy_sub0, sy_sub1, step_y);
                 float subMaxZ = t_to_exit(o.z, d.z, sz_sub0, sz_sub1, step_z);
@@ -267,7 +368,7 @@ __global__ void rasterize_kernel(
                 while (sub_x >= 0 && sub_x < 4 && sub_y >= 0 && sub_y < 4 && sub_z >= 0 && sub_z < 4 && t_cur <= brick_exit_t) {
                     int bit = (sub_x << 4) | (sub_y << 2) | sub_z;
                     if (brick_mask & (1ULL << bit)) {
-                        search_start_t = t_cur; // 射线进入第一个含占据子块的时刻
+                        search_start_t = t_cur;
                         break;
                     }
                     if (subMaxX < subMaxY) {
@@ -302,15 +403,7 @@ __global__ void rasterize_kernel(
                 }
             }
 
-            // 收集当前砖内射线命中；命中较多时改为无缓冲前到后扫描以避免溢出。
-            struct Hit {
-                float t_enter;
-                float t_exit;
-                int key_idx;
-            };
-            constexpr int kMaxBufferedHits = 256;
-            Hit hit_buf[kMaxBufferedHits];
-            int buffered_hits = 0;
+            // 收集命中（小缓冲）
             int total_hits = 0;
             for (int64_t i = off0; i < off1; ++i) {
                 int64_t vx = keys[i * 3 + 0];
@@ -323,123 +416,105 @@ __global__ void rasterize_kernel(
                                           vmin.y + voxel_size,
                                           vmin.z + voxel_size);
                 float vt0, vt1;
-                if (!intersect_aabb(o, d, vmin, vmax, vt0, vt1) || vt1 < 0.f) {
-                    continue;
-                }
+                if (!intersect_aabb(o, d, vmin, vmax, vt0, vt1) || vt1 < 0.f) continue;
                 if (vt0 < 0.f) vt0 = 0.f;
                 float t_start = fmaxf(vt0, search_start_t);
                 float t_end = fminf(vt1, brick_exit_t);
                 if (t_end <= t_start) continue;
-                if (buffered_hits < kMaxBufferedHits) {
-                    hit_buf[buffered_hits].t_enter = t_start;
-                    hit_buf[buffered_hits].t_exit = t_end;
-                    hit_buf[buffered_hits].key_idx = static_cast<int>(i);
-                    ++buffered_hits;
+                if (total_hits < kMaxHits) {
+                    hit_buf[total_hits].t_enter = t_start;
+                    hit_buf[total_hits].t_exit = t_end;
+                    hit_buf[total_hits].key_idx = static_cast<int>(i);
                 }
                 ++total_hits;
             }
 
-            int out_idx = idx * 3;
-            float* out_ptr = out + out_idx;
-            if (total_hits > 0) {
-                if (total_hits <= kMaxBufferedHits) {
-                    // 插入排序（命中数量受限于缓冲大小）
-                    for (int a = 1; a < buffered_hits; ++a) {
-                        Hit cur = hit_buf[a];
-                        int b = a - 1;
-                        while (b >= 0 && hit_buf[b].t_enter > cur.t_enter) {
-                            hit_buf[b + 1] = hit_buf[b];
-                            --b;
-                        }
-                        hit_buf[b + 1] = cur;
-                    }
-                    for (int h = 0; h < buffered_hits; ++h) {
-                        int64_t key_idx = hit_buf[h].key_idx;
-                        int64_t vx = keys[key_idx * 3 + 0];
-                        int64_t vy = keys[key_idx * 3 + 1];
-                        int64_t vz = keys[key_idx * 3 + 2];
-                        float3 vmin = make_float3(origin.x + voxel_size * vx,
-                                                  origin.y + voxel_size * vy,
-                                                  origin.z + voxel_size * vz);
-                        float3 vmax = make_float3(vmin.x + voxel_size,
-                                                  vmin.y + voxel_size,
-                                                  vmin.z + voxel_size);
-                        float t_start = hit_buf[h].t_enter;
-                        float t_end = hit_buf[h].t_exit;
-                        float3 p0_seg = make_float3(o.x + d.x * t_start,
-                                                    o.y + d.y * t_start,
-                                                    o.z + d.z * t_start);
-                        float3 p1_seg = make_float3(o.x + d.x * t_end,
-                                                    o.y + d.y * t_end,
-                                                    o.z + d.z * t_end);
-                        shade_voxel_segment(
-                            p0_seg, p1_seg, vmin, vmax, static_cast<int>(vx), static_cast<int>(vy), static_cast<int>(vz),
-                            vertex_sigma, vertex_color, vertex_valid,
-                            make_int3(dims.x + 1, dims.y + 1, dims.z + 1),
-                            transmittance, out_ptr);
-                        if (transmittance < 1e-4f) return; // 透射率很低时提前退出
-                    }
-                } else {
-                    // 回退：命中数量超过缓冲，按前到后逐次选最早段，避免丢失。
-                    float cursor_t = search_start_t;
-                    while (cursor_t < brick_exit_t && transmittance > 1e-4f) {
-                        float best_in = brick_exit_t;
-                        float best_out = brick_exit_t;
-                        int best_idx = -1;
-                        for (int64_t i = off0; i < off1; ++i) {
-                            int64_t vx = keys[i * 3 + 0];
-                            int64_t vy = keys[i * 3 + 1];
-                            int64_t vz = keys[i * 3 + 2];
-                            float3 vmin = make_float3(origin.x + voxel_size * vx,
-                                                      origin.y + voxel_size * vy,
-                                                      origin.z + voxel_size * vz);
-                            float3 vmax = make_float3(vmin.x + voxel_size,
-                                                      vmin.y + voxel_size,
-                                                      vmin.z + voxel_size);
-                            float vt0, vt1;
-                            if (!intersect_aabb(o, d, vmin, vmax, vt0, vt1) || vt1 < 0.f) {
-                                continue;
-                            }
-                            if (vt0 < 0.f) vt0 = 0.f;
-                            float t_start = fmaxf(vt0, cursor_t);
-                            float t_end = fminf(vt1, brick_exit_t);
-                            if (t_end <= t_start) continue;
-                            if (t_start < best_in) {
-                                best_in = t_start;
-                                best_out = t_end;
-                                best_idx = static_cast<int>(i);
-                            }
-                        }
-                        if (best_idx < 0) break;
+            if (total_hits > kMaxHits) {
+                // 极端密集砖：退化为不存储，直接跳过梯度计算以避免溢出
+                return;
+            }
 
-                        int64_t vx = keys[best_idx * 3 + 0];
-                        int64_t vy = keys[best_idx * 3 + 1];
-                        int64_t vz = keys[best_idx * 3 + 2];
-                        float3 vmin = make_float3(origin.x + voxel_size * vx,
-                                                  origin.y + voxel_size * vy,
-                                                  origin.z + voxel_size * vz);
-                        float3 vmax = make_float3(vmin.x + voxel_size,
-                                                  vmin.y + voxel_size,
-                                                  vmin.z + voxel_size);
-                        float3 p0_seg = make_float3(o.x + d.x * best_in,
-                                                    o.y + d.y * best_in,
-                                                    o.z + d.z * best_in);
-                        float3 p1_seg = make_float3(o.x + d.x * best_out,
-                                                    o.y + d.y * best_out,
-                                                    o.z + d.z * best_out);
-                        shade_voxel_segment(
-                            p0_seg, p1_seg, vmin, vmax, static_cast<int>(vx), static_cast<int>(vy), static_cast<int>(vz),
-                            vertex_sigma, vertex_color, vertex_valid,
-                            make_int3(dims.x + 1, dims.y + 1, dims.z + 1),
-                            transmittance, out_ptr);
-                        if (transmittance < 1e-4f) return;
-                        cursor_t = best_out + eps; // 往前推进，避免重复命中同一段
-                    }
+            // 排序
+            hit_count = total_hits;
+            for (int a = 1; a < hit_count; ++a) {
+                Hit cur = hit_buf[a];
+                int b = a - 1;
+                while (b >= 0 && hit_buf[b].t_enter > cur.t_enter) {
+                    hit_buf[b + 1] = hit_buf[b];
+                    --b;
                 }
+                hit_buf[b + 1] = cur;
+            }
+
+            // 前向累积 T / sigma
+            float trans = 1.f;
+            for (int h = 0; h < hit_count; ++h) {
+                int64_t key_idx = hit_buf[h].key_idx;
+                int64_t vx = keys[key_idx * 3 + 0];
+                int64_t vy = keys[key_idx * 3 + 1];
+                int64_t vz = keys[key_idx * 3 + 2];
+                float3 vmin = make_float3(origin.x + voxel_size * vx,
+                                          origin.y + voxel_size * vy,
+                                          origin.z + voxel_size * vz);
+                float3 vmax = make_float3(vmin.x + voxel_size,
+                                          vmin.y + voxel_size,
+                                          vmin.z + voxel_size);
+                float3 p0_seg = make_float3(o.x + d.x * hit_buf[h].t_enter,
+                                            o.y + d.y * hit_buf[h].t_enter,
+                                            o.z + d.z * hit_buf[h].t_enter);
+                float3 p1_seg = make_float3(o.x + d.x * hit_buf[h].t_exit,
+                                            o.y + d.y * hit_buf[h].t_exit,
+                                            o.z + d.z * hit_buf[h].t_exit);
+
+                float sigma_m, dt, exp_term;
+                float3 col_m_dummy;
+                compute_segment_values(
+                    p0_seg, p1_seg, vmin, vmax, static_cast<int>(vx), static_cast<int>(vy), static_cast<int>(vz),
+                    vertex_sigma, vertex_color, vertex_valid,
+                    make_int3(dims.x + 1, dims.y + 1, dims.z + 1),
+                    sigma_m, col_m_dummy, dt, exp_term);
+                hit_buf[h].sigma_m = sigma_m;
+                hit_buf[h].dt = dt;
+                hit_buf[h].exp_term = exp_term;
+                hit_buf[h].T_in = trans;
+                trans *= exp_term;
+                if (trans < 1e-4f) { hit_count = h + 1; break; }
+            }
+
+            // 反向（倒序）
+            float grad_T_next = 0.f;
+            for (int h = hit_count - 1; h >= 0; --h) {
+                int64_t key_idx = hit_buf[h].key_idx;
+                int64_t vx = keys[key_idx * 3 + 0];
+                int64_t vy = keys[key_idx * 3 + 1];
+                int64_t vz = keys[key_idx * 3 + 2];
+                float3 vmin = make_float3(origin.x + voxel_size * vx,
+                                          origin.y + voxel_size * vy,
+                                          origin.z + voxel_size * vz);
+                float3 vmax = make_float3(vmin.x + voxel_size,
+                                          vmin.y + voxel_size,
+                                          vmin.z + voxel_size);
+                float3 p0_seg = make_float3(o.x + d.x * hit_buf[h].t_enter,
+                                            o.y + d.y * hit_buf[h].t_enter,
+                                            o.z + d.z * hit_buf[h].t_enter);
+                float3 p1_seg = make_float3(o.x + d.x * hit_buf[h].t_exit,
+                                            o.y + d.y * hit_buf[h].t_exit,
+                                            o.z + d.z * hit_buf[h].t_exit);
+                float grad_T_out = 0.f;
+                float sigma_m_dummy, dt_dummy, exp_term_dummy;
+                // 重新计算，用存储的 T_in / grad_T_next 驱动梯度。
+                shade_segment_backward(
+                    p0_seg, p1_seg, vmin, vmax, static_cast<int>(vx), static_cast<int>(vy), static_cast<int>(vz),
+                    vertex_sigma, vertex_color, vertex_valid,
+                    make_int3(dims.x + 1, dims.y + 1, dims.z + 1),
+                    grad_out_ptr, hit_buf[h].T_in, grad_T_next, grad_T_out,
+                    sigma_m_dummy, dt_dummy, exp_term_dummy,
+                    grad_sigma, grad_color);
+                grad_T_next = grad_T_out;
             }
         }
 
-        // 前进到下一个 coarse brick
+        // DDA 到下一个砖
         if (tMaxX < tMaxY) {
             if (tMaxX < tMaxZ) {
                 t0 = tMaxX;
@@ -474,7 +549,7 @@ __global__ void rasterize_kernel(
 
 } // namespace
 
-torch::Tensor rasterize_forward_cuda(
+std::vector<torch::Tensor> rasterize_backward_cuda(
     const torch::Tensor& rays_o,
     const torch::Tensor& rays_d,
     const torch::Tensor& coarse_offsets,
@@ -483,6 +558,7 @@ torch::Tensor rasterize_forward_cuda(
     const torch::Tensor& vertex_sigma,
     const torch::Tensor& vertex_color,
     const torch::Tensor& vertex_mask,
+    const torch::Tensor& grad_output,
     int64_t height,
     int64_t width,
     float origin_x,
@@ -496,52 +572,43 @@ torch::Tensor rasterize_forward_cuda(
     int64_t brick_y,
     int64_t brick_z,
     int64_t coarse_res) {
-    // 检查并转换
     if (!rays_o.is_cuda() || !rays_d.is_cuda())
         throw std::invalid_argument("rays_o and rays_d must be CUDA tensors");
+    if (!grad_output.is_cuda())
+        throw std::invalid_argument("grad_output must be CUDA tensor");
     auto ro = rays_o.contiguous().to(torch::kFloat32);
     auto rd = rays_d.contiguous().to(torch::kFloat32);
+    auto gout = grad_output.contiguous().to(torch::kFloat32);
     c10::cuda::CUDAGuard device_guard(ro.device());
+
     auto offsets = coarse_offsets.contiguous();
     auto keys = voxel_keys.contiguous();
     auto mask = coarse_mask.contiguous();
-    const bool has_vertex = vertex_sigma.defined() && vertex_color.defined() &&
-                            vertex_sigma.numel() > 0 && vertex_color.numel() > 0;
-    auto v_sigma = has_vertex ? vertex_sigma.to(ro.device()).contiguous().to(torch::kFloat32) : torch::Tensor();
-    auto v_color = has_vertex ? vertex_color.to(ro.device()).contiguous().to(torch::kFloat32) : torch::Tensor();
+
+    auto v_sigma = vertex_sigma.to(ro.device()).contiguous().to(torch::kFloat32);
+    auto v_color = vertex_color.to(ro.device()).contiguous().to(torch::kFloat32);
     auto v_mask  = (vertex_mask.defined() && vertex_mask.numel() > 0)
         ? vertex_mask.to(ro.device()).contiguous()
         : torch::Tensor();
 
+    auto grad_sigma = torch::zeros_like(v_sigma);
+    auto grad_color = torch::zeros_like(v_color);
+
     const int64_t num_rays = ro.size(0);
-    auto out = torch::zeros({height, width, 3}, torch::TensorOptions().device(ro.device()).dtype(torch::kFloat32));
-
-
-    // int minGridSize = 0;
-    // int blockSize = 0;
-    // // 动态共享内存用 0（本 kernel 没用动态 shared）
-    // cudaOccupancyMaxPotentialBlockSize(
-    //     &minGridSize,      // 返回最小 grid 大小
-    //     &blockSize,        // 返回推荐 block size
-    //     rasterize_kernel,  // kernel 函数指针
-    //     0,                 // 动态 shared bytes
-    //     0);                // block 大小时的上限 0=无上限
-
-    // const int threads = blockSize;
-    // const int blocks = (static_cast<int>(num_rays) + threads - 1) / threads;
-
     const int threads = 256;
     const int blocks = (static_cast<int>(num_rays) + threads - 1) / threads;
-    rasterize_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+    rasterize_backward_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
         ro.data_ptr<float>(),
         rd.data_ptr<float>(),
         offsets.data_ptr<int64_t>(),
         keys.data_ptr<int64_t>(),
         mask.data_ptr<uint64_t>(),
-        has_vertex ? v_sigma.data_ptr<float>() : nullptr,
-        has_vertex ? v_color.data_ptr<float>() : nullptr,
+        v_sigma.data_ptr<float>(),
+        v_color.data_ptr<float>(),
         v_mask.defined() ? v_mask.data_ptr<uint8_t>() : nullptr,
-        out.data_ptr<float>(),
+        gout.data_ptr<float>(),
+        grad_sigma.data_ptr<float>(),
+        grad_color.data_ptr<float>(),
         num_rays,
         width,
         make_float3(origin_x, origin_y, origin_z),
@@ -550,5 +617,5 @@ torch::Tensor rasterize_forward_cuda(
         make_int3(static_cast<int>(brick_x), static_cast<int>(brick_y), static_cast<int>(brick_z)),
         coarse_res);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    return {grad_sigma, grad_color};
 }

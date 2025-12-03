@@ -21,6 +21,7 @@ sources = [
 ]
 cuda_sources = [
     "src/rasterizer_cuda.cu",
+    "src/rasterizer_backward_cuda.cu",
 ]
 
 ext_modules = [

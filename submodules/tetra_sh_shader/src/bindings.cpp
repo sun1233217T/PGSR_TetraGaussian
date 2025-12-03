@@ -141,4 +141,11 @@ PYBIND11_MODULE(tetra_sh_shader_cpp, m) {
     m.def("build_dense_vertex_grids_from_features", &build_dense_vertex_grids_from_features,
           py::arg("grid"), py::arg("vertex_features"),
           "将顶点特征映射到稠密网格 (sigma, color, valid, xyz)");
+    m.def("rasterize_image_with_index_dense_backward", &rasterize_image_with_index_dense_backward,
+          py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
+          py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
+          py::arg("vertex_sigma"), py::arg("vertex_color"), py::arg("vertex_mask"),
+          py::arg("grad_output"),
+          py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
+          "反向：输入 grad_output 和 dense 顶点网格，返回 (grad_sigma, grad_color)");
 }

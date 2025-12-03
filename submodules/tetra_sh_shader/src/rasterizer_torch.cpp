@@ -310,3 +310,62 @@ torch::Tensor rasterize_image_with_index_dense(
         brick_x, brick_y, brick_z,
         coarse_res);
 }
+
+std::vector<torch::Tensor> rasterize_image_with_index_dense_backward(
+    VoxelGrid& grid,
+    const torch::Tensor& intrinsic,
+    const torch::Tensor& extrinsic,
+    const torch::Tensor& coarse_offsets,
+    const torch::Tensor& voxel_keys,
+    const torch::Tensor& coarse_mask,
+    const torch::Tensor& vertex_sigma,
+    const torch::Tensor& vertex_color,
+    const torch::Tensor& vertex_mask,
+    const torch::Tensor& grad_output,
+    int64_t height,
+    int64_t width,
+    int64_t coarse_res) {
+    check_matrix(intrinsic, 3, 3, "intrinsic");
+    check_matrix(extrinsic, 4, 4, "extrinsic");
+    if (!torch::cuda::is_available()) {
+        throw std::runtime_error("CUDA is required for rasterize_image_with_index_dense_backward");
+    }
+    torch::Device device(torch::kCUDA);
+
+    // 相机参数 -> 射线
+    auto rays = build_rays_from_camera(intrinsic, extrinsic, height, width, device);
+    torch::Tensor rays_o = rays.first.contiguous();
+    torch::Tensor rays_d = rays.second.contiguous();
+
+    Vec3 origin = grid.origin();
+    Vec3i dims = grid.dims();
+    double voxel_size = grid.voxel_size();
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) {
+        throw std::runtime_error("grid dims are zero; cannot rasterize backward");
+    }
+    int64_t brick_x = static_cast<int64_t>(std::ceil(static_cast<double>(dims.x) / coarse_res));
+    int64_t brick_y = static_cast<int64_t>(std::ceil(static_cast<double>(dims.y) / coarse_res));
+    int64_t brick_z = static_cast<int64_t>(std::ceil(static_cast<double>(dims.z) / coarse_res));
+
+    // 将预计算的 coarse 索引搬到 GPU
+    auto offsets = coarse_offsets.to(device).contiguous();
+    auto keys = voxel_keys.to(device).contiguous();
+    auto mask = coarse_mask.to(device).contiguous();
+
+    auto v_sigma = vertex_sigma.to(device).contiguous().to(torch::kFloat32);
+    auto v_color = vertex_color.to(device).contiguous().to(torch::kFloat32);
+    auto v_mask = vertex_mask.defined() && vertex_mask.numel() > 0
+        ? vertex_mask.to(device).contiguous()
+        : torch::Tensor();
+    auto gout = grad_output.to(device).contiguous().to(torch::kFloat32);
+
+    return rasterize_backward_cuda(
+        rays_o, rays_d, offsets, keys, mask,
+        v_sigma, v_color, v_mask, gout,
+        height, width,
+        static_cast<float>(origin.x), static_cast<float>(origin.y), static_cast<float>(origin.z),
+        static_cast<float>(voxel_size),
+        dims.x, dims.y, dims.z,
+        brick_x, brick_y, brick_z,
+        coarse_res);
+}

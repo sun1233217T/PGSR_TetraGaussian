@@ -32,6 +32,7 @@ from tetra_sh_shader_cpp import (
     rasterize_image,
     rasterize_image_with_index,
     rasterize_image_with_index_dense,
+    rasterize_image_with_index_dense_backward,
     build_dense_vertex_grids_from_features,
 )
 from .pre_resterization import (
@@ -88,6 +89,7 @@ __all__ = [
     "rasterize_image",
     "rasterize_image_with_index",
     "rasterize_image_with_index_dense",
+    "rasterize_image_with_index_dense_backward",
     "build_dense_vertex_grids_from_features",
     "rasterize",
     "rasterize_with_coarse",
