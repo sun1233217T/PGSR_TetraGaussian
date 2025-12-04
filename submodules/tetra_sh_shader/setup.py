@@ -28,10 +28,15 @@ ext_modules = [
     CUDAExtension(
         "tetra_sh_shader_cpp",
         sources=sources + cuda_sources,
+        # extra_compile_args={
+        #     "cxx": ["-fopenmp"],
+        #     "nvcc": ["-lineinfo"],
+        # },
         extra_compile_args={
-            "cxx": ["-fopenmp"],
-            "nvcc": ["-lineinfo"],
+            "cxx": ["-fopenmp", "-O3", "-DNDEBUG"],
+            "nvcc": ["-lineinfo", "-O3", "-DNDEBUG"],
         },
+
         extra_link_args=["-fopenmp"],
     )
 ]

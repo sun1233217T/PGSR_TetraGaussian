@@ -141,6 +141,10 @@ PYBIND11_MODULE(tetra_sh_shader_cpp, m) {
     m.def("build_dense_vertex_grids_from_features", &build_dense_vertex_grids_from_features,
           py::arg("grid"), py::arg("vertex_features"),
           "将顶点特征映射到稠密网格 (sigma, color, valid, xyz)");
+    m.def("build_packed_dense_vertex_grids_from_features", &build_packed_dense_vertex_grids_from_features,
+          py::arg("grid"), py::arg("vertex_features"), py::arg("coarse_offsets"),
+          py::arg("coarse_res") = 8, py::arg("on_cuda") = false,
+          "按 coarse 砖打包的稠密顶点网格，返回 (sigma_packed, color_packed, valid_packed, brick_starts, brick_shapes, brick_vertex_offsets)");
     m.def("rasterize_image_with_index_dense_backward", &rasterize_image_with_index_dense_backward,
           py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
           py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
@@ -148,4 +152,19 @@ PYBIND11_MODULE(tetra_sh_shader_cpp, m) {
           py::arg("grad_output"),
           py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
           "反向：输入 grad_output 和 dense 顶点网格，返回 (grad_sigma, grad_color)");
+    m.def("rasterize_image_with_index_packed", &rasterize_image_with_index_packed,
+          py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
+          py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
+          py::arg("vertex_sigma_packed"), py::arg("vertex_color_packed"), py::arg("vertex_mask_packed"),
+          py::arg("brick_starts"), py::arg("brick_shapes"), py::arg("brick_vertex_offsets"),
+          py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
+          "使用打包稠密顶点网格的渲染");
+    m.def("rasterize_image_with_index_packed_backward", &rasterize_image_with_index_packed_backward,
+          py::arg("grid"), py::arg("intrinsic"), py::arg("extrinsic"),
+          py::arg("coarse_offsets"), py::arg("voxel_keys"), py::arg("coarse_mask"),
+          py::arg("vertex_sigma_packed"), py::arg("vertex_color_packed"), py::arg("vertex_mask_packed"),
+          py::arg("brick_starts"), py::arg("brick_shapes"), py::arg("brick_vertex_offsets"),
+          py::arg("grad_output"),
+          py::arg("height"), py::arg("width"), py::arg("coarse_res") = 8,
+          "反向：打包稠密顶点网格版本，返回 (grad_sigma, grad_color)");
 }

@@ -21,9 +21,13 @@ from tetra_sh_shader import (
     initialize_vertex_features,
     rasterize_with_coarse,
     build_dense_vertex_grids_from_features,
+    build_packed_dense_vertex_grids_from_features,
 )
 from tetra_sh_shader.pre_resterization import cameras_from_scene
 from scene.dataset_readers import sceneLoadTypeCallbacks
+
+from mtools import debug
+import time
 
 
 def load_tetra():
@@ -51,6 +55,8 @@ def main() -> int:
     parser.add_argument("--lr", type=float, default=1e-2, help="学习率")
     parser.add_argument("--render", action="store_true", help="训练结束后写出渲染结果")
     parser.add_argument("--dump-coarse", action="store_true", help="打印 coarse 统计")
+    parser.add_argument("--packed-dense", action="store_true", help="使用按 coarse 砖打包的稠密网格，节省内存/显存")
+    parser.add_argument("--one_image_only", action="store_true", help="只使用一张图像进行训练")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -96,18 +102,31 @@ def main() -> int:
         sparse,
         4,
         device="cpu",
-        fill_value=0.1,
+        fill_value=0.8,
         as_int=False,
     )
     if vertex_features.numel() > 0:
-        vertex_features[:, 0] = 1.0
-    vertex_dense = build_dense_vertex_grids_from_features(sparse, vertex_features)
-    sigma, color, valid, xyz = vertex_dense
+        vertex_features[:, 0] = 0.2
+    if args.packed_dense:
+        packed = build_packed_dense_vertex_grids_from_features(
+            sparse, vertex_features, coarse_tuple[1], coarse_res=args.render_coarse_res, on_cuda=False
+        )
+        sigma, color, valid, brick_starts, brick_shapes, brick_offsets = packed
+    else:
+        sigma, color, valid, xyz = build_dense_vertex_grids_from_features(sparse, vertex_features)
+
+
     sigma = sigma.to(device).requires_grad_()
     color = color.to(device).requires_grad_()
     valid = valid.to(device)
-    xyz = xyz.to(device)
-    vertex_dense = (sigma, color, valid, xyz)
+    if args.packed_dense:
+        brick_starts = brick_starts.to(device)
+        brick_shapes = brick_shapes.to(device)
+        brick_offsets = brick_offsets.to(device)
+        vertex_dense = (sigma, color, valid, brick_starts, brick_shapes, brick_offsets)
+    else:
+        xyz = xyz.to(device)
+        vertex_dense = (sigma, color, valid, xyz)
 
     optimizer = torch.optim.Adam([sigma, color], lr=args.lr)
 
@@ -116,23 +135,41 @@ def main() -> int:
         optimizer.zero_grad()
         loss_acc = 0.0
         for cam in cam_data:
+            torch.cuda.synchronize()
+            t0 = time.time()
+
             intr_t = torch.tensor(cam["intr"], device=device)
             extr_t = torch.tensor(cam["ext"], device=device)
             target = cam["target"].to(device)
+
+            torch.cuda.synchronize()
+            t1 = time.time()
+
             colors = rasterize_with_coarse(
-                sparse,
-                intr_t,
-                extr_t,
-                coarse_tuple,
-                cam["H"],
-                cam["W"],
-                coarse_res=args.render_coarse_res,
-                vertex_features=None,
-                vertex_dense=vertex_dense,
-            )
+                    sparse,
+                    intr_t,
+                    extr_t,
+                    coarse_tuple,
+                    cam["H"],
+                    cam["W"],
+                    coarse_res=args.render_coarse_res,
+                    vertex_features=None,
+                    vertex_dense=vertex_dense,
+                    )
+
+            torch.cuda.synchronize()
+            t2 = time.time()
+
             loss = (colors - target).pow(2).mean()
             loss.backward()
+
+            torch.cuda.synchronize()
+            t3 = time.time()
+
             loss_acc += loss.item()
+            print(f"[train] it={it+1} cam time: rasterize={(t2 - t1)*1000:.2f} ms, "
+                f"loss_backprop={(t3 - t2)*1000:.2f} ms, total={(t3 - t0)*1000:.2f} ms, loss={loss.item():.6f}")
+
         loss_acc /= float(len(cam_data))
         optimizer.step()
         print(f"[train] iter {it+1}/{args.iters} mean_loss={loss_acc:.6f}")
@@ -145,6 +182,7 @@ def main() -> int:
                 cam0 = cam_data[i]
                 intr_t = torch.tensor(cam0["intr"], device=device)
                 extr_t = torch.tensor(cam0["ext"], device=device)
+                time0 = time.time()
                 colors = rasterize_with_coarse(
                     sparse,
                     intr_t,
@@ -156,6 +194,8 @@ def main() -> int:
                     vertex_features=None,
                     vertex_dense=vertex_dense,
                 )
+                time1 = time.time()
+                print(f"[train] render time: {(time1 - time0)*1000:.2f} ms")
             img = colors.detach().cpu().clamp(0, 1).numpy()
             img = (img * 255).astype(np.uint8)
             out_path = out_dir / "train_render_{:02d}.png".format(i)

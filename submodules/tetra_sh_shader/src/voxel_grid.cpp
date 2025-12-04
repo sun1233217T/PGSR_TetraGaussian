@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <iostream>
 
 std::shared_ptr<Vertex> VoxelGrid::get_or_create_vertex(const VoxelKey& key) {
     auto it = vertices_.find(key);
@@ -44,6 +45,7 @@ void VoxelGrid::build_dense(const Vec3& origin, const Vec3& size, double voxel_s
     const int64_t ny = static_cast<int64_t>(std::ceil(size.y / voxel_size));
     const int64_t nz = static_cast<int64_t>(std::ceil(size.z / voxel_size));
     dims_ = Vec3i(nx, ny, nz);
+    std::cout << "VoxelGrid::build_dense: dims = (" << nx << ", " << ny << ", " << nz << ")" << std::endl;
 
     for (int64_t ix = 0; ix < nx; ++ix) {
         for (int64_t iy = 0; iy < ny; ++iy) {

@@ -165,6 +165,7 @@ def pre_rasterize_scene(
     origin_vec = Vec3(*origin_np.tolist())
     size_vec = Vec3(*size_np.tolist())
     grid.build_dense(origin_vec, size_vec, voxel_size)
+    
 
     # 反削除：mask==0，tolerant=0，invert=True
     grid_init(grid)

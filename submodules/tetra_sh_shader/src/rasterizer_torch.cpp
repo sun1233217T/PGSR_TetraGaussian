@@ -129,6 +129,171 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> build_den
     return {sigma_cpu, color_cpu, valid_cpu, xyz_cpu};
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+build_packed_dense_vertex_grids_from_features(
+    VoxelGrid& grid,
+    const torch::Tensor& vertex_features,
+    const torch::Tensor& coarse_offsets,
+    int64_t coarse_res,
+    bool on_cuda) {
+    if (!vertex_features.defined() || vertex_features.numel() == 0) {
+        auto opts_i = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+        torch::Tensor empty_i = torch::zeros({0}, opts_i);
+        torch::Tensor empty_f = torch::zeros({0}, opts_f);
+        torch::Tensor empty_u8 = torch::zeros({0}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+        return {empty_f, torch::zeros({0, 3}, opts_f), empty_u8, empty_i.reshape({0, 3}), empty_i.reshape({0, 3}), empty_i};
+    }
+    if (vertex_features.dim() != 2 || vertex_features.size(1) < 4) {
+        throw std::invalid_argument("vertex_features must have shape (N,4) or (N,>=4)");
+    }
+
+    const int64_t B = coarse_res * coarse_res * coarse_res;
+    auto offsets_cpu = coarse_offsets.to(torch::kCPU).contiguous();
+    auto offsets_acc = offsets_cpu.accessor<int64_t, 1>();
+
+    Vec3i dims = grid.dims();
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) {
+        throw std::invalid_argument("grid dims must be positive for packing");
+    }
+    const int64_t brick_size_x = static_cast<int64_t>(std::ceil(static_cast<double>(dims.x) / coarse_res));
+    const int64_t brick_size_y = static_cast<int64_t>(std::ceil(static_cast<double>(dims.y) / coarse_res));
+    const int64_t brick_size_z = static_cast<int64_t>(std::ceil(static_cast<double>(dims.z) / coarse_res));
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    auto brick_starts = torch::zeros({B, 3}, opts_i64);
+    auto brick_shapes = torch::zeros({B, 3}, opts_i64);
+    auto brick_vertex_offsets = torch::zeros({B + 1}, opts_i64);
+
+    auto starts_acc = brick_starts.accessor<int64_t, 2>();
+    auto shapes_acc = brick_shapes.accessor<int64_t, 2>();
+    auto vert_off_acc = brick_vertex_offsets.accessor<int64_t, 1>();
+
+    // prefix sum of vertex counts per brick
+    for (int64_t b = 0; b < B; ++b) {
+        const int64_t off0 = offsets_acc[b];
+        const int64_t off1 = offsets_acc[b + 1];
+        if (off1 == off0) {
+            vert_off_acc[b + 1] = vert_off_acc[b];
+            continue;
+        }
+        const int64_t bx = b / (coarse_res * coarse_res);
+        const int64_t by = (b / coarse_res) % coarse_res;
+        const int64_t bz = b % coarse_res;
+        const int64_t start_x = bx * brick_size_x;
+        const int64_t start_y = by * brick_size_y;
+        const int64_t start_z = bz * brick_size_z;
+        const int64_t size_x = std::min<int64_t>(brick_size_x, dims.x - start_x);
+        const int64_t size_y = std::min<int64_t>(brick_size_y, dims.y - start_y);
+        const int64_t size_z = std::min<int64_t>(brick_size_z, dims.z - start_z);
+        starts_acc[b][0] = start_x;
+        starts_acc[b][1] = start_y;
+        starts_acc[b][2] = start_z;
+        shapes_acc[b][0] = size_x;
+        shapes_acc[b][1] = size_y;
+        shapes_acc[b][2] = size_z;
+        const int64_t verts = (size_x + 1) * (size_y + 1) * (size_z + 1);
+        vert_off_acc[b + 1] = vert_off_acc[b] + verts;
+    }
+    const int64_t total_verts = vert_off_acc[B];
+
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+    auto sigma_cpu = torch::zeros({total_verts}, opts_f32);
+    auto color_cpu = torch::zeros({total_verts, 3}, opts_f32);
+    auto valid_cpu = torch::zeros({total_verts}, opts_u8);
+
+    // key -> row idx
+    auto ordered = sorted_vertices(grid);
+    std::unordered_map<VoxelKey, int64_t, VoxelKeyHash> key_to_row;
+    key_to_row.reserve(ordered.size());
+    int64_t row = 0;
+    for (const auto& kv : ordered) {
+        key_to_row.emplace(kv.first, row++);
+    }
+    auto feats_cpu = vertex_features.to(torch::kCPU).contiguous().to(torch::kFloat32);
+    auto feats_acc = feats_cpu.accessor<float, 2>();
+    auto starts_a = brick_starts.accessor<int64_t, 2>();
+    auto shapes_a = brick_shapes.accessor<int64_t, 2>();
+    auto sig_ptr = sigma_cpu.data_ptr<float>();
+    auto col_ptr = color_cpu.data_ptr<float>();
+    auto val_ptr = valid_cpu.data_ptr<uint8_t>();
+
+    // helper for vertex index in packed buffer
+    auto vert_index = [&](int64_t b, int64_t lx, int64_t ly, int64_t lz) -> int64_t {
+        const int64_t sx = shapes_a[b][0] + 1;
+        const int64_t sy = shapes_a[b][1] + 1;
+        const int64_t sz = shapes_a[b][2] + 1;
+        const int64_t base = vert_off_acc[b];
+        return base + (lx * sy + ly) * sz + lz;
+    };
+
+    // voxel keys tensor is torch::Tensor? coarse_offsets only passed; reuse sorted grid.cells? Instead rely on offsets+grid.cells order can't.
+    // We still need voxel keys list; rebuild from grid.cells sorted by brick for determinism.
+    // Collect voxel keys by brick to avoid passing another tensor.
+    std::vector<std::vector<VoxelKey>> brick_keys(B);
+    for (const auto& kv : grid.cells()) {
+        const VoxelKey& ck = kv.first;
+        int64_t bx = ck.x / brick_size_x;
+        int64_t by = ck.y / brick_size_y;
+        int64_t bz = ck.z / brick_size_z;
+        if (bx >= coarse_res) bx = coarse_res - 1;
+        if (by >= coarse_res) by = coarse_res - 1;
+        if (bz >= coarse_res) bz = coarse_res - 1;
+        int64_t b = (bx * coarse_res + by) * coarse_res + bz;
+        brick_keys[b].push_back(ck);
+    }
+
+    const int dx[8] = {0, 1, 0, 1, 0, 1, 0, 1};
+    const int dy[8] = {0, 0, 1, 1, 0, 0, 1, 1};
+    const int dz[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+
+    for (int64_t b = 0; b < B; ++b) {
+        if (shapes_a[b][0] == 0 || shapes_a[b][1] == 0 || shapes_a[b][2] == 0) continue;
+        const int64_t start_x = starts_a[b][0];
+        const int64_t start_y = starts_a[b][1];
+        const int64_t start_z = starts_a[b][2];
+        const int64_t size_x = shapes_a[b][0];
+        const int64_t size_y = shapes_a[b][1];
+        const int64_t size_z = shapes_a[b][2];
+        for (const auto& ck : brick_keys[b]) {
+            int64_t lx = ck.x - start_x;
+            int64_t ly = ck.y - start_y;
+            int64_t lz = ck.z - start_z;
+            if (lx < 0 || ly < 0 || lz < 0 || lx >= size_x || ly >= size_y || lz >= size_z) continue;
+            for (int i = 0; i < 8; ++i) {
+                VoxelKey vk{ck.x + dx[i], ck.y + dy[i], ck.z + dz[i]};
+                auto it = key_to_row.find(vk);
+                if (it == key_to_row.end()) continue;
+                int64_t vx = vk.x - start_x;
+                int64_t vy = vk.y - start_y;
+                int64_t vz = vk.z - start_z;
+                if (vx < 0 || vy < 0 || vz < 0 || vx > size_x || vy > size_y || vz > size_z) continue;
+                int64_t idx = vert_index(b, vx, vy, vz);
+                const int64_t r = it->second;
+                sig_ptr[idx] = feats_acc[r][0];
+                col_ptr[idx * 3 + 0] = feats_acc[r][1];
+                col_ptr[idx * 3 + 1] = feats_acc[r][2];
+                col_ptr[idx * 3 + 2] = feats_acc[r][3];
+                val_ptr[idx] = 1;
+            }
+        }
+    }
+
+    if (on_cuda) {
+        auto device = torch::kCUDA;
+        return {
+            sigma_cpu.to(device),
+            color_cpu.to(device),
+            valid_cpu.to(device),
+            brick_starts.to(device),
+            brick_shapes.to(device),
+            brick_vertex_offsets.to(device),
+        };
+    }
+    return {sigma_cpu, color_cpu, valid_cpu, brick_starts, brick_shapes, brick_vertex_offsets};
+}
+
 torch::Tensor rasterize_image(
     VoxelGrid& grid,
     const torch::Tensor& intrinsic,
@@ -311,6 +476,69 @@ torch::Tensor rasterize_image_with_index_dense(
         coarse_res);
 }
 
+torch::Tensor rasterize_image_with_index_packed(
+    VoxelGrid& grid,
+    const torch::Tensor& intrinsic,
+    const torch::Tensor& extrinsic,
+    const torch::Tensor& coarse_offsets,
+    const torch::Tensor& voxel_keys,
+    const torch::Tensor& coarse_mask,
+    const torch::Tensor& vertex_sigma_packed,
+    const torch::Tensor& vertex_color_packed,
+    const torch::Tensor& vertex_mask_packed,
+    const torch::Tensor& brick_starts,
+    const torch::Tensor& brick_shapes,
+    const torch::Tensor& brick_vertex_offsets,
+    int64_t height,
+    int64_t width,
+    int64_t coarse_res) {
+    check_matrix(intrinsic, 3, 3, "intrinsic");
+    check_matrix(extrinsic, 4, 4, "extrinsic");
+    if (!torch::cuda::is_available()) {
+        throw std::runtime_error("CUDA is required for rasterize_image_with_index_packed");
+    }
+    torch::Device device(torch::kCUDA);
+
+    auto rays = build_rays_from_camera(intrinsic, extrinsic, height, width, device);
+    torch::Tensor rays_o = rays.first.contiguous();
+    torch::Tensor rays_d = rays.second.contiguous();
+
+    Vec3 origin = grid.origin();
+    Vec3i dims = grid.dims();
+    double voxel_size = grid.voxel_size();
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) {
+        throw std::runtime_error("grid dims are zero; cannot rasterize");
+    }
+    int64_t brick_x = static_cast<int64_t>(std::ceil(static_cast<double>(dims.x) / coarse_res));
+    int64_t brick_y = static_cast<int64_t>(std::ceil(static_cast<double>(dims.y) / coarse_res));
+    int64_t brick_z = static_cast<int64_t>(std::ceil(static_cast<double>(dims.z) / coarse_res));
+
+    auto offsets = coarse_offsets.to(device).contiguous();
+    auto keys = voxel_keys.to(device).contiguous();
+    auto mask = coarse_mask.to(device).contiguous();
+
+    auto v_sigma = vertex_sigma_packed.to(device).contiguous().to(torch::kFloat32);
+    auto v_color = vertex_color_packed.to(device).contiguous().to(torch::kFloat32);
+    auto v_mask = (vertex_mask_packed.defined() && vertex_mask_packed.numel() > 0)
+        ? vertex_mask_packed.to(device).contiguous()
+        : torch::Tensor();
+
+    auto b_starts = brick_starts.to(device).contiguous();
+    auto b_shapes = brick_shapes.to(device).contiguous();
+    auto b_offsets = brick_vertex_offsets.to(device).contiguous();
+
+    return rasterize_forward_packed_cuda(
+        rays_o, rays_d, offsets, keys, mask,
+        v_sigma, v_color, v_mask,
+        b_starts, b_shapes, b_offsets,
+        height, width,
+        static_cast<float>(origin.x), static_cast<float>(origin.y), static_cast<float>(origin.z),
+        static_cast<float>(voxel_size),
+        dims.x, dims.y, dims.z,
+        brick_x, brick_y, brick_z,
+        coarse_res);
+}
+
 std::vector<torch::Tensor> rasterize_image_with_index_dense_backward(
     VoxelGrid& grid,
     const torch::Tensor& intrinsic,
@@ -362,6 +590,71 @@ std::vector<torch::Tensor> rasterize_image_with_index_dense_backward(
     return rasterize_backward_cuda(
         rays_o, rays_d, offsets, keys, mask,
         v_sigma, v_color, v_mask, gout,
+        height, width,
+        static_cast<float>(origin.x), static_cast<float>(origin.y), static_cast<float>(origin.z),
+        static_cast<float>(voxel_size),
+        dims.x, dims.y, dims.z,
+        brick_x, brick_y, brick_z,
+        coarse_res);
+}
+
+std::vector<torch::Tensor> rasterize_image_with_index_packed_backward(
+    VoxelGrid& grid,
+    const torch::Tensor& intrinsic,
+    const torch::Tensor& extrinsic,
+    const torch::Tensor& coarse_offsets,
+    const torch::Tensor& voxel_keys,
+    const torch::Tensor& coarse_mask,
+    const torch::Tensor& vertex_sigma_packed,
+    const torch::Tensor& vertex_color_packed,
+    const torch::Tensor& vertex_mask_packed,
+    const torch::Tensor& brick_starts,
+    const torch::Tensor& brick_shapes,
+    const torch::Tensor& brick_vertex_offsets,
+    const torch::Tensor& grad_output,
+    int64_t height,
+    int64_t width,
+    int64_t coarse_res) {
+    check_matrix(intrinsic, 3, 3, "intrinsic");
+    check_matrix(extrinsic, 4, 4, "extrinsic");
+    if (!torch::cuda::is_available()) {
+        throw std::runtime_error("CUDA is required for rasterize_image_with_index_packed_backward");
+    }
+    torch::Device device(torch::kCUDA);
+
+    auto rays = build_rays_from_camera(intrinsic, extrinsic, height, width, device);
+    torch::Tensor rays_o = rays.first.contiguous();
+    torch::Tensor rays_d = rays.second.contiguous();
+
+    Vec3 origin = grid.origin();
+    Vec3i dims = grid.dims();
+    double voxel_size = grid.voxel_size();
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) {
+        throw std::runtime_error("grid dims are zero; cannot rasterize backward");
+    }
+    int64_t brick_x = static_cast<int64_t>(std::ceil(static_cast<double>(dims.x) / coarse_res));
+    int64_t brick_y = static_cast<int64_t>(std::ceil(static_cast<double>(dims.y) / coarse_res));
+    int64_t brick_z = static_cast<int64_t>(std::ceil(static_cast<double>(dims.z) / coarse_res));
+
+    auto offsets = coarse_offsets.to(device).contiguous();
+    auto keys = voxel_keys.to(device).contiguous();
+    auto mask = coarse_mask.to(device).contiguous();
+
+    auto v_sigma = vertex_sigma_packed.to(device).contiguous().to(torch::kFloat32);
+    auto v_color = vertex_color_packed.to(device).contiguous().to(torch::kFloat32);
+    auto v_mask = (vertex_mask_packed.defined() && vertex_mask_packed.numel() > 0)
+        ? vertex_mask_packed.to(device).contiguous()
+        : torch::Tensor();
+    auto b_starts = brick_starts.to(device).contiguous();
+    auto b_shapes = brick_shapes.to(device).contiguous();
+    auto b_offsets = brick_vertex_offsets.to(device).contiguous();
+    auto gout = grad_output.to(device).contiguous().to(torch::kFloat32);
+
+    return rasterize_backward_packed_cuda(
+        rays_o, rays_d, offsets, keys, mask,
+        v_sigma, v_color, v_mask,
+        b_starts, b_shapes, b_offsets,
+        gout,
         height, width,
         static_cast<float>(origin.x), static_cast<float>(origin.y), static_cast<float>(origin.z),
         static_cast<float>(voxel_size),

@@ -33,7 +33,10 @@ from tetra_sh_shader_cpp import (
     rasterize_image_with_index,
     rasterize_image_with_index_dense,
     rasterize_image_with_index_dense_backward,
+    rasterize_image_with_index_packed,
+    rasterize_image_with_index_packed_backward,
     build_dense_vertex_grids_from_features,
+    build_packed_dense_vertex_grids_from_features,
 )
 from .pre_resterization import (
     rays_from_image_mask,
@@ -90,7 +93,10 @@ __all__ = [
     "rasterize_image_with_index",
     "rasterize_image_with_index_dense",
     "rasterize_image_with_index_dense_backward",
+    "rasterize_image_with_index_packed",
+    "rasterize_image_with_index_packed_backward",
     "build_dense_vertex_grids_from_features",
+    "build_packed_dense_vertex_grids_from_features",
     "rasterize",
     "rasterize_with_coarse",
     "VoxelRasterizeFunction",
